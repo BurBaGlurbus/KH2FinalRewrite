@@ -634,10 +634,12 @@ pub fn tick(game: &mut Game, tick: u64) {
                         "sub":st.sub,"amount":heal,"sora_hp":rt.sora_hp}),
                     );
                 } else if let Some(member) = members.get_mut(st.party - 1) {
-                    member.hp = (member.hp + heal).min(member.max_hp);
+                    // A dead member is revived by the heal (FUN_1403c3c30).
+                    let revived = super::party_room::heal_member(member, heal);
                     events.push(
                         serde_json::json!({"event":"heal","tick":tick,"atkp":st.atkp,
-                        "sub":st.sub,"amount":heal,"member":member.kind.name,"hp":member.hp}),
+                        "sub":st.sub,"amount":heal,"member":member.kind.name,"hp":member.hp,
+                        "revived":revived}),
                     );
                 }
             }

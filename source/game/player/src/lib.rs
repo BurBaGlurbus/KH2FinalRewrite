@@ -20,6 +20,7 @@ pub mod forms;
 pub mod growth;
 pub mod limit_form;
 pub mod magic;
+pub mod party_hit;
 pub mod party_members;
 pub mod party_spell;
 pub mod ptya;

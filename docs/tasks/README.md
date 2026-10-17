@@ -140,6 +140,7 @@ Records through T128 retain historical commands and paths. See [the folder guide
 | [T130](T130-source-folder.md) | Group app folders under source and rename the validator | NOT RUN for the final merge; engineering checks above PASS on the branch. |
 | [T131](T131-source-group-data-effect-audio-extras.md) | Move data, effect, audio and extras under source | NOT RUN for the final merge; the build check above passes on the branch. |
 | [T136](T136-magic-effects-and-combos.md) | Magic: the spells' own effects, form variants and the combo check | PARTIAL: spells play their own effects in four forms and join the combo; Cure has a party menu; Donald casts his four spells, Goofy his Tornado and Turbo; Magic Lock-On works; no owner playtest or capture comparison. |
+| [T186](T186-party-hit-ko-interrupt-reflect.md) | Donald and Goofy being hit: reactions, KO and revive, interrupted casts, the Blizzard shot's reflect | PARTIAL. |
 | [T170](T170-lock-camera-and-scan-gauge.md) | Lock-on camera (mode 2) and the Scan target gauge | PARTIAL. |
 | [T140](T140-game-over.md) | Sora's game over | PARTIAL. |
 | [T160](T160-level-up-and-bonus-levels.md) | Sora's level-up panels, level-up effect and bonus levels | PARTIAL. |

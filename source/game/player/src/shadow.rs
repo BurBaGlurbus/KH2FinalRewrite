@@ -255,6 +255,13 @@ pub struct Shadow {
     /// Last tick's moved distance, for the slither's stuck test.
     moved: f32,
     wished: f32,
+    /// Where the last player-side attacker stands, when it is alive
+    /// (obj+0xd40, FUN_140411300): the revenge target. The room sets it
+    /// before each tick; None when it is dead or absent.
+    pub attacker_pos: Option<Vec3>,
+    /// `target_search(obj, 1)` ran last: the target record names the last
+    /// attacker until `mode_battle` or the appearance searches Sora again.
+    tracks_attacker: bool,
 }
 
 impl Shadow {
@@ -288,6 +295,8 @@ impl Shadow {
             gone_ticks: 0,
             moved: 0.,
             wished: 0.,
+            attacker_pos: None,
+            tracks_attacker: false,
         };
         // OBJ_MAIN: act_start("appear_shadow"); act_push("mode_battle").
         s.act_start(ActKind::AppearShadow);
@@ -392,6 +401,21 @@ impl Shadow {
         attacker: &AttackerStats,
         difficulty: combat::Difficulty,
     ) -> Option<i32> {
+        self.hit_by(direction, high, attack, attacker, difficulty, true)
+    }
+
+    /// `hit` with the attacker's kind: OBJ_DAMAGE starts `mode_revenge` for
+    /// a hit by the player character (`0x6c8` bit 7) and `mode_battle` for
+    /// any other (Donald, Goofy).
+    pub fn hit_by(
+        &mut self,
+        direction: Vec3,
+        high: bool,
+        attack: &AttackParams,
+        attacker: &AttackerStats,
+        difficulty: combat::Difficulty,
+        by_player: bool,
+    ) -> Option<i32> {
         if !self.targetable() {
             return None;
         }
@@ -443,8 +467,13 @@ impl Shadow {
             // Engine: act_start("dead") at HP 0.
             self.act_start(ActKind::Dead);
         } else if class > 1 {
-            // OBJ_DAMAGE: a reacting hit by the player starts mode_revenge.
-            self.act_start(ActKind::ModeRevenge);
+            // OBJ_DAMAGE: a reacting hit by the player starts mode_revenge,
+            // by anyone else mode_battle.
+            self.act_start(if by_player {
+                ActKind::ModeRevenge
+            } else {
+                ActKind::ModeBattle
+            });
         }
         Some(dmg)
     }
@@ -725,6 +754,22 @@ impl Shadow {
         target: Vec3,
         player: Vec3,
     ) -> bool {
+        // target_search: mode_battle and the appearance look for Sora (the
+        // battle target table is empty), mode_revenge for the last attacker
+        // when it is alive (FUN_1403be2b0 case 1); the later acts keep the
+        // record.
+        let target = match act.kind {
+            ActKind::ModeRevenge => {
+                self.tracks_attacker = true;
+                self.attacker_pos.unwrap_or(target)
+            }
+            ActKind::ModeBattle | ActKind::AppearShadow => {
+                self.tracks_attacker = false;
+                target
+            }
+            _ if self.tracks_attacker => self.attacker_pos.unwrap_or(target),
+            _ => target,
+        };
         let to_target = {
             let mut v = sub(target, self.position);
             v[1] = 0.;
@@ -1265,5 +1310,83 @@ mod tests {
             s.tick(&mut rng, &clips, &Flat, [0., 0., 500.], [0., 0., 500.]);
         }
         assert!(s.gone);
+    }
+
+    fn flinch() -> AttackParams {
+        AttackParams {
+            power: 1,
+            stat: 0,
+            element: 0,
+            reaction: 3,
+            knockback: [3, 0],
+            ..AttackParams::default()
+        }
+    }
+
+    fn weak_attacker() -> AttackerStats {
+        AttackerStats {
+            strength: 1,
+            magic: 1,
+            max: 99999,
+            min: 1,
+            ..AttackerStats::default()
+        }
+    }
+
+    #[test]
+    fn a_reacting_hit_by_the_player_starts_revenge_and_by_a_party_member_starts_battle() {
+        let clips = TestClips(HashMap::new());
+        let standard = combat::Difficulty::Standard;
+        for (by_player, want) in [(true, ActKind::ModeRevenge), (false, ActKind::ModeBattle)] {
+            let mut rng = ScriptRandom::default();
+            let mut s = Shadow::new([0.; 3], 0., stats(), sstm());
+            for _ in 0..200 {
+                s.tick(&mut rng, &clips, &Flat, [0., 0., 500.], [0., 0., 500.]);
+            }
+            s.sunk = false;
+            s.hit_by(
+                [0., 0., 1.],
+                true,
+                &flinch(),
+                &weak_attacker(),
+                standard,
+                by_player,
+            )
+            .unwrap();
+            assert_eq!(s.current_act(), Some(want), "by_player {by_player}");
+        }
+    }
+
+    #[test]
+    fn revenge_turns_the_shadow_toward_the_last_attacker_and_battle_back_to_sora() {
+        let clips = TestClips(HashMap::new());
+        let mut rng = ScriptRandom::default();
+        let mut s = Shadow::new([0.; 3], 0., stats(), sstm());
+        for _ in 0..200 {
+            s.tick(&mut rng, &clips, &Flat, [0., 0., 500.], [0., 0., 500.]);
+        }
+        s.sunk = false;
+        // Sora stands north, the last attacker far to the east.
+        s.attacker_pos = Some([800., 0., 0.]);
+        s.act_clear();
+        s.act_start(ActKind::ModeRevenge);
+        s.tick(&mut rng, &clips, &Flat, [0., 0., 500.], [0., 0., 500.]);
+        assert!(s.tracks_attacker);
+        // d = 800 >= 600: rvg_long, which walks toward the attacker.
+        assert!(matches!(
+            s.current_act(),
+            Some(ActKind::RvgLong | ActKind::MoveShadowRound | ActKind::Leave)
+        ));
+        // mode_battle searches Sora again.
+        s.act_clear();
+        s.act_start(ActKind::ModeBattle);
+        s.tick(&mut rng, &clips, &Flat, [0., 0., 500.], [0., 0., 500.]);
+        assert!(!s.tracks_attacker);
+        // No live attacker: Sora.
+        s.attacker_pos = None;
+        s.act_clear();
+        s.act_start(ActKind::ModeRevenge);
+        s.tick(&mut rng, &clips, &Flat, [0., 0., 500.], [0., 0., 500.]);
+        assert!(s.tracks_attacker);
     }
 }

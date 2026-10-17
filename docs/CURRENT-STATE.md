@@ -105,9 +105,9 @@ Unfinished (verdict PARTIAL):
 - The pause menu uses a plain list, not the original's art; no cursor sounds.
 - What happens after the scene ends (music, fade) is unknown.
 
-### Donald and Goofy in the party — not started
+### Donald and Goofy in the party — PARTIAL (T136, T186)
 
-The camp's Party screen exists, but Donald and Goofy are not in the field: no models in the room, no AI, no party attacks, no party-target menus. Cure and the party-wide items act on Sora only.
+Donald and Goofy follow Sora and fight in the test room (ground attacks, Donald's four spells, Goofy's Tornado and Turbo, the Cure target menu). The enemy's claws now hit them: flinch and blow reactions, Goofy's shield, KO with the revive timer, a revive by Cure, and a hit during a cast ends or pauses it as in the executable (T186). Not built: their voices, a HUD gauge, items, Limits, Goofy's Bash, air attacks.
 
 ### Drive forms — not started
 

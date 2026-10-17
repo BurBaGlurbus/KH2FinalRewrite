@@ -14,7 +14,9 @@
 //! (`FUN_1401b53b0`) and an MP bar that is not charging, and play the act of
 //! `party_spell`.
 
-use crate::{Body, Vec3, World};
+use crate::actor_physics::{Knock, Sstm};
+use crate::party_hit;
+use crate::{Body, Hit, Vec3, World};
 
 /// Walk and run speeds per tick (PRTY words 0 and 1: 2.0 and 8.0).
 pub const WALK_SPEED: f32 = 2.;
@@ -206,6 +208,15 @@ pub struct Follower {
     special: Special,
     /// Downward speed while falling after a special.
     fall: f32,
+    /// A hit reaction in progress (FUN_1403d2fe0): the member cannot act.
+    pub reaction: Option<party_hit::Reaction>,
+    /// A knock-slide that has no reaction motion (reaction class 1).
+    slide: Option<Knock>,
+    /// KO: the revive timer (obj+0xdc0) while the dead bit (obj+0x9b8 bit
+    /// 2) is set.
+    pub down: Option<f32>,
+    /// The DEAD motion has started (`FUN_1403c3660`).
+    laid: bool,
 }
 
 fn wrap(a: f32) -> f32 {
@@ -241,6 +252,15 @@ pub struct Scene<'a, W: World> {
     pub mp: Option<(i32, i32, bool)>,
     /// HP and maximum HP of Sora, Donald and Goofy (None: absent).
     pub hp: [Option<(i32, i32)>; 3],
+    /// The motion's range 2 start, the tick a reaction lets the member act
+    /// again (`obj+0x18c` bits 2-4).
+    pub actionable: &'a dyn Fn(u16) -> Option<u32>,
+    /// SSTM (knock-back and blow constants) and the KO rates.
+    pub sstm: Sstm,
+    pub rates: party_hit::Rates,
+    /// The battle flag (`DAT_142a11404`): the KO timer runs at 1.0 a tick
+    /// instead of SSTM+0x5c.
+    pub battle: bool,
 }
 
 impl Follower {
@@ -258,12 +278,22 @@ impl Follower {
             permit: false,
             special: Special::new(),
             fall: 0.,
+            reaction: None,
+            slide: None,
+            down: None,
+            laid: false,
         }
     }
 
     /// The motion id playing: an attack, or the gait (idle 0, walk 1,
     /// run 2).
     pub fn motion(&self) -> u16 {
+        if let Some(r) = self.reaction {
+            return r.motion;
+        }
+        if self.laid {
+            return party_hit::motion::DEAD;
+        }
         if let Some(a) = self.attack {
             return a.motion;
         }
@@ -530,9 +560,127 @@ impl Follower {
         self.rand(10_000) as f32 / 10_000.
     }
 
+    /// Whether the member is above the floor (`FUN_1403ba9a0`).
+    pub fn airborne<W: World>(&self, world: &W) -> bool {
+        world
+            .floor(self.position[0], self.position[2], self.position[1])
+            .is_some_and(|f| self.position[1] > f + 0.5)
+    }
+
+    /// The reaction a hit starts (`FUN_1403d2fe0` through FRIEND vt+0xc8):
+    /// the member's attack or walk ends, its motion becomes the flinch or
+    /// blow and the knock-slide begins. `has` tells which motions the
+    /// member's set holds. Returns the motion that started.
+    pub fn react<W: World>(
+        &mut self,
+        hit: &Hit,
+        sstm: &Sstm,
+        world: &W,
+        has: &dyn Fn(u16) -> bool,
+    ) -> Option<u16> {
+        let started = party_hit::start(
+            hit,
+            sstm,
+            [self.yaw.sin(), self.yaw.cos()],
+            self.position[1],
+            self.airborne(world),
+            has,
+        );
+        if let Some(yaw) = started.yaw {
+            self.yaw = yaw;
+        }
+        if started.slide.is_some() {
+            self.slide = started.slide;
+        }
+        let r = started.reaction?;
+        self.begin_reaction(r);
+        Some(r.motion)
+    }
+
+    /// The guard bounce (`FUN_1403d4650` with motion -1).
+    pub fn bounce<W: World>(
+        &mut self,
+        sstm: &Sstm,
+        world: &W,
+        has: &dyn Fn(u16) -> bool,
+    ) -> Option<u16> {
+        let r = party_hit::bounce(
+            [self.yaw.sin(), self.yaw.cos()],
+            self.airborne(world),
+            sstm,
+            has,
+        )?;
+        self.begin_reaction(r);
+        Some(r.motion)
+    }
+
+    fn begin_reaction(&mut self, r: party_hit::Reaction) {
+        self.attack = None;
+        self.special = Special::new();
+        self.gait = Gait::Stand;
+        self.reaction = Some(r);
+        self.tick = 0;
+        self.laid = false;
+    }
+
+    /// HP reached 0 (`FUN_1403c33d0` through vt+0xb0): the dead bit and the
+    /// revive timer (`prty[6]`).
+    pub fn ko(&mut self, timer: f32) {
+        self.down = Some(timer);
+        self.attack = None;
+        self.special = Special::new();
+        self.laid = false;
+    }
+
+    /// The timer has run out (`FUN_1403c3660` calls `FUN_1403c3bd0`).
+    pub fn revive_due(&self) -> bool {
+        self.down.is_some_and(|t| t <= 0.)
+    }
+
+    /// A heal on the dead member (`FUN_1403c3c30`): the dead bit clears and
+    /// motion 55 plays from 54.
+    pub fn revive(&mut self, sstm: &Sstm) {
+        if self.down.take().is_some() && self.laid {
+            self.begin_reaction(party_hit::get_up(sstm));
+        }
+        self.laid = false;
+    }
+
     /// One tick: finish or continue an attack, else choose one against the
     /// target, else approach the target or follow the leader.
     pub fn tick<W: World>(&mut self, records: &[Record], scene: &Scene<W>) {
+        // The KO timer runs whatever the member is doing (FUN_1403c3660).
+        if let Some(t) = self.down.as_mut() {
+            *t -= scene.rates.countdown(scene.battle);
+        }
+        if let Some(k) = self.slide.as_mut() {
+            match k.step() {
+                Some(d) => {
+                    self.position = scene
+                        .world
+                        .collide(self.position, d, false, &scene.body)
+                        .position
+                }
+                None => self.slide = None,
+            }
+        }
+        // A reaction locks the member until its motion lets it act.
+        if let Some(mut r) = self.reaction {
+            let env = party_hit::Env {
+                world: scene.world,
+                body: scene.body,
+                length: scene.length,
+                actionable: scene.actionable,
+            };
+            let (position, done) = r.step(self.position, &env);
+            self.position = position;
+            self.tick = r.tick;
+            self.reaction = (!done).then_some(r);
+            if done {
+                self.tick = 0;
+            }
+            return;
+        }
         // An attack plays out its motion with root motion, then ends.
         if let Some(mut a) = self.attack {
             a.tick += 1;
@@ -570,6 +718,18 @@ impl Follower {
             return;
         }
         self.fall = 0.;
+        // Down: the DEAD motion starts once the member is on the ground
+        // and can act (FUN_1403c3660), and holds until the revive.
+        if self.down.is_some() {
+            self.attack = None;
+            if self.laid {
+                self.tick += 1;
+            } else {
+                self.laid = true;
+                self.tick = 0;
+            }
+            return;
+        }
         // A running spell act holds the member where it stands.
         if scene.busy {
             self.gait = Gait::Stand;
@@ -666,6 +826,34 @@ mod tests {
     fn no_root(_: u16, _: u32) -> Vec3 {
         [0.; 3]
     }
+    fn no_actionable(_: u16) -> Option<u32> {
+        None
+    }
+    pub(super) fn test_sstm() -> Sstm {
+        let mut record = [0u8; 0x3c];
+        for (at, v) in [
+            (0x14usize, 16f32),
+            (0x18, 0.8),
+            (0x1c, 0.1),
+            (0x20, 0.8),
+            (0x24, 24.),
+            (0x28, 40.),
+            (0x2c, 8.),
+            (0x30, 200.),
+            (0x34, 200.),
+            (0x38, 0.048),
+        ] {
+            record[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        Sstm::read(&record).unwrap()
+    }
+    pub(super) fn test_rates() -> party_hit::Rates {
+        party_hit::Rates {
+            revive_keep: 0.5,
+            revive_hp: 0.5,
+            ko_speed: 8.,
+        }
+    }
     fn no_range(m: u16) -> Option<(u32, u32)> {
         match m {
             191 => Some((50, 380)),
@@ -689,6 +877,10 @@ mod tests {
             range: &no_range,
             mp: None,
             hp: [None; 3],
+            actionable: &no_actionable,
+            sstm: test_sstm(),
+            rates: test_rates(),
+            battle: true,
         }
     }
 
@@ -787,6 +979,10 @@ mod tests {
             range: &no_range,
             mp: Some(mp),
             hp,
+            actionable: &no_actionable,
+            sstm: test_sstm(),
+            rates: test_rates(),
+            battle: true,
         }
     }
 
@@ -894,5 +1090,138 @@ mod tests {
         // And it stops when the range ends (attack tick 330).
         assert_eq!(z_at[340], z_at[345]);
         assert!(z_at[345] > 3000.);
+    }
+
+    fn all_motions(_: u16) -> Option<u32> {
+        Some(70)
+    }
+    fn ready_at_58(_: u16) -> Option<u32> {
+        Some(58)
+    }
+    fn reaction_scene<'a>(
+        world: &'a Flat,
+        target: Option<Target>,
+        battle: bool,
+    ) -> Scene<'a, Flat> {
+        Scene {
+            leader: [0., 0., 0.],
+            leader_yaw: 0.,
+            target,
+            world,
+            body: BODY,
+            length: &all_motions,
+            root: &no_root,
+            busy: false,
+            spells: false,
+            centre: None,
+            leader_y: 0.,
+            range: &no_range,
+            mp: None,
+            hp: [None; 3],
+            actionable: &ready_at_58,
+            sstm: test_sstm(),
+            rates: test_rates(),
+            battle,
+        }
+    }
+    fn claw_hit() -> Hit {
+        Hit {
+            reaction: 3,
+            original: 3,
+            direction: [0., -1.],
+            high: true,
+            knockback: [0x7fff, 0],
+        }
+    }
+
+    #[test]
+    fn a_hit_ends_the_attack_and_locks_the_member_until_the_reaction_lets_it_act() {
+        let t = Target {
+            position: [0., 0., 100.],
+            radius: 40.,
+        };
+        let mut f = Follower::spawn([0., 0., 0.], 0., 0);
+        f.begin(&DONALD[0], &t, 0);
+        assert!(f.attack.is_some());
+        let sstm = test_sstm();
+        let motion = f.react(&claw_hit(), &sstm, &Flat, &|m| m < 100);
+        assert_eq!(motion, Some(10));
+        assert!(f.attack.is_none());
+        assert_eq!(f.motion(), 10);
+        // An enemy stands in range, yet nothing is chosen while locked.
+        for _ in 0..57 {
+            f.tick(&DONALD, &reaction_scene(&Flat, Some(t), true));
+            assert_eq!(f.motion(), 10);
+            assert!(f.attack.is_none());
+        }
+        f.tick(&DONALD, &reaction_scene(&Flat, Some(t), true));
+        assert!(f.reaction.is_none());
+        // The slide carried the member along the hit, toward -z.
+        assert!(f.position[2] < -30.);
+        // Free again: the next tick decides.
+        f.tick(&DONALD, &reaction_scene(&Flat, Some(t), true));
+        assert!(f.attack.is_some() || f.gait != Gait::Stand);
+    }
+
+    #[test]
+    fn a_ko_member_plays_its_reaction_then_lies_down_until_the_timer_and_a_heal() {
+        let mut f = Follower::spawn([0., 0., 0.], 0., 0);
+        let sstm = test_sstm();
+        f.ko(3600.);
+        f.react(&claw_hit(), &sstm, &Flat, &|m| m < 100);
+        // The killing blow's reaction plays out first.
+        for _ in 0..40 {
+            f.tick(&DONALD, &reaction_scene(&Flat, None, false));
+            assert_eq!(f.motion(), 10);
+        }
+        for _ in 0..40 {
+            f.tick(&DONALD, &reaction_scene(&Flat, None, false));
+        }
+        assert_eq!(f.motion(), party_hit::motion::DEAD);
+        // Outside battle the timer falls 8 a tick: 3600 lasts 450 ticks
+        // from the KO.
+        let mut ticks = 80;
+        while !f.revive_due() {
+            f.tick(&DONALD, &reaction_scene(&Flat, None, false));
+            ticks += 1;
+            assert!(ticks < 1000);
+        }
+        assert_eq!(ticks, 450);
+        assert_eq!(f.motion(), party_hit::motion::DEAD);
+        // The heal gets it up with motion 55, then it acts again.
+        f.revive(&sstm);
+        assert!(f.down.is_none());
+        assert_eq!(f.motion(), party_hit::motion::REVIVE);
+        for _ in 0..58 {
+            f.tick(&DONALD, &reaction_scene(&Flat, None, false));
+        }
+        assert!(f.reaction.is_none());
+        assert_eq!(f.motion(), 0);
+    }
+
+    #[test]
+    fn the_ko_timer_runs_at_one_a_tick_in_battle() {
+        let mut f = Follower::spawn([0., 0., 0.], 0., 0);
+        f.ko(100.);
+        for _ in 0..99 {
+            f.tick(&DONALD, &reaction_scene(&Flat, None, true));
+        }
+        assert!(!f.revive_due());
+        f.tick(&DONALD, &reaction_scene(&Flat, None, true));
+        assert!(f.revive_due());
+    }
+
+    #[test]
+    fn a_guard_bounce_slides_the_member_back_and_returns_it_to_the_ai() {
+        let mut f = Follower::spawn([0., 0., 0.], 0., 0);
+        let sstm = test_sstm();
+        assert_eq!(f.bounce(&sstm, &Flat, &|_| true), Some(41));
+        assert_eq!(f.motion(), 41);
+        for _ in 0..70 {
+            f.tick(&DONALD, &reaction_scene(&Flat, None, true));
+        }
+        assert!(f.reaction.is_none());
+        // Facing +z, so the slide went toward -z.
+        assert!(f.position[2] < -30.);
     }
 }

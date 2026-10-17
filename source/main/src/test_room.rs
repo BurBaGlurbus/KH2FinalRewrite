@@ -87,6 +87,7 @@ mod journal_tour;
 mod level_growth;
 mod magic_room;
 mod magic_tour;
+mod party_hit_tour;
 mod party_room;
 mod prize_room;
 mod settings_room;
@@ -917,6 +918,18 @@ struct Game {
     fx_calls: Vec<spell_fx::Call>,
     /// The party's AI may cast (Donald's spells).
     party_spells: bool,
+    /// The battle flag (`DAT_142a11404`) with its switching delay.
+    party_battle: party_room::BattleMode,
+    /// The party-hit tour (`--party-hit-tour`).
+    party_hit_tour: bool,
+    party_hit_state: party_hit_tour::State,
+    /// The Type 3 guard spheres of the enemies' attacks this tick (centre,
+    /// radius): what a party member's Type 1 shot clashes with.
+    enemy_guards: Vec<(Vec3, f32)>,
+    /// The party's attack volumes of the last tick and the gallery enemies
+    /// a member may aim at (party_room, enemy_battle_hits).
+    party_volumes: Vec<party_room::OutVolume>,
+    gallery_targets: Vec<party_room::GalleryTarget>,
     fx_live: HashMap<u64, magic::FxLive>,
     /// The party slot the Magic menu's Cure target list picked (0 Sora)
     /// and the Magic row Cure was chosen from, while that list is open.
@@ -2231,6 +2244,12 @@ struct EnemyRuntime {
     sora_invulnerable: f32,
     /// Motion serial and tick already scanned for sound triggers.
     sound_tick: Option<(u32, u32)>,
+    /// The claw spheres of this tick, for the party members' hit tests
+    /// (party_room): the Shadow's attack windows swept from last tick.
+    claws_now: Vec<party_room::ClawSample>,
+    /// The last player-side attacker of the Shadow (obj+0xd40,
+    /// FUN_140411300): the revenge target.
+    last_attacker: party_room::Attacker,
 }
 
 /// A placeholder for a spell's hit volume: the spell effects (the `.mag`
@@ -3408,12 +3427,29 @@ fn load(
                             &system,
                             lvup,
                             plrp,
+                            &objects,
                             name,
                             character,
                             records,
                         ) {
-                            Ok(k) => {
+                            Ok(mut k) => {
                                 eprintln!("party member {} loaded", k.name);
+                                // The member's battle voices: the same vtbl rows
+                                // and `voice/us/battle/<world>0_<name>` (the
+                                // exe's `%s%d_%s` with sora, donald, goofy).
+                                let who = if character == 2 { "donald" } else { "goofy" };
+                                k.voices = library
+                                    .read(&format!(
+                                        "voice/us/battle/{voice_world}0_{who}.win32.scd"
+                                    ))
+                                    .ok()
+                                    .and_then(|bytes| banks.insert(bytes).ok())
+                                    .and_then(|bank| {
+                                        drive_room::Voices::read(
+                                            bar_entry(&battle, b"vtbl").ok()?,
+                                            bank,
+                                        )
+                                    });
                                 kinds.push(std::sync::Arc::new(k));
                             }
                             Err(e) => eprintln!("party member {name}: {e}"),
@@ -6404,6 +6440,9 @@ fn simulate(
             "spell":format!("{spell:?}"),"heal":heal,"ordered":ordered}),
         );
     }
+    if game.party_hit_tour {
+        party_hit_tour::drive(&mut game, tick);
+    }
     party_room::tick(&mut game, tick);
     // Drive: requests, the form change, the form gauge (after the player
     // tick, like FUN_1403a92c0 / FUN_140404a40).
@@ -7804,6 +7843,7 @@ fn combat_tick(game: &mut Game, tick: u64) {
         enemy_battle_tour,
         magic_tour,
         magic_shift,
+        party,
         ..
     } = game;
     let Some(rt) = enemy.as_mut() else { return };
@@ -8057,6 +8097,8 @@ fn combat_tick(game: &mut Game, tick: u64) {
             rt.enemy
                 .hit(dir.to_array(), high, &attack, &rt.sora, rt.difficulty)
         {
+            // FUN_140411300: the Shadow remembers who hit it last.
+            rt.last_attacker = party_room::Attacker::Sora;
             // FUN_1403d12c0: the attacker's obj+0x120 bit 25, which lets
             // the next press chain the combo.
             player.connected = true;
@@ -8170,6 +8212,7 @@ fn combat_tick(game: &mut Game, tick: u64) {
             && cone(g, sora_facing, from_shadow)
             && cone(c, shadow_facing, -from_shadow)
     };
+    let mut claw_samples: Vec<party_room::ClawSample> = Vec::new();
     if rt.enabled && e.alive() && !e.sunk {
         let bones = &ec.bones[(tick_in as usize).min(ec.bones.len() - 1)];
         let sora_bones = &cp.body[frame.min(cp.body.len().saturating_sub(1))];
@@ -8199,15 +8242,32 @@ fn combat_tick(game: &mut Game, tick: u64) {
                 };
                 (rt.ids.allocate(), group)
             });
-            if rt.sora_record.has(aid) {
-                continue;
-            }
+            let sora_has = rt.sora_record.has(aid);
+            let group_id = rt.instance_ids[&instance].1;
             for (i, &(b, offset, radius)) in rt.claws.get(&group).into_iter().flatten().enumerate()
             {
                 let Some(m) = bones.get(&b) else { continue };
                 let centre = enemy_at + enemy_turn * m.transform_point3(offset);
                 let previous = rt.claw_previous.insert((instance, i), centre);
-                for c in combat::swept(centre.to_array(), previous.map(|p| p.to_array()), radius) {
+                let points =
+                    combat::swept(centre.to_array(), previous.map(|p| p.to_array()), radius);
+                if let Some(rows) = rt.steps.get(&(atkp, 0)) {
+                    claw_samples.push(party_room::ClawSample {
+                        instance,
+                        atkp,
+                        aid,
+                        group: group_id,
+                        radius,
+                        centre,
+                        points: points.clone(),
+                        rows: rows.clone(),
+                        only: None,
+                    });
+                }
+                if sora_has {
+                    continue;
+                }
+                for c in points {
                     // Attack-vs-attack clashes run before the body pass.
                     if clash.is_none()
                         && let Some(&(g, gr, guard, gkey)) =
@@ -8235,6 +8295,7 @@ fn combat_tick(game: &mut Game, tick: u64) {
             }
         }
     }
+    rt.claws_now = claw_samples;
     // A guarded claw: FUN_1403d2140 both ways, Sora's FUN_1403d61d0 and the
     // Shadow's FUN_140411060.
     if let Some((instance, claw, guard, claw_at, g, gr, gkey)) = clash
@@ -8469,6 +8530,14 @@ fn combat_tick(game: &mut Game, tick: u64) {
         }
     }
     let before = rt.enemy.current_act();
+    // The revenge target: the last player-side attacker, when it is alive.
+    rt.enemy.attacker_pos = match rt.last_attacker {
+        party_room::Attacker::Sora => Some(player.position),
+        party_room::Attacker::Member(i) => party
+            .get(i)
+            .filter(|m| !m.stored && m.follower.down.is_none())
+            .map(|m| m.follower.position),
+    };
     if rt.enabled && !cheats.enemy_frozen {
         rt.enemy.tick(
             &mut rt.rng,
@@ -10613,6 +10682,7 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
     let mut enemy_tour = false;
     let mut enemy_battle_tour = false;
     let mut magic_tour = false;
+    let mut party_hit_tour = false;
     let mut magic_form = 0u8;
     let mut growth_tour = false;
     let mut prize_tour = false;
@@ -10687,6 +10757,19 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
                         .next()
                         .cloned()
                         .ok_or("magic tour capture directory absent")?,
+                );
+            }
+            // The party-hit tour runs inside the magic tour's setup (an
+            // invincible Sora, a frozen Shadow, no menus) with its own
+            // schedule in place of the magic tour's.
+            Some("--party-hit-tour") if autoplay.is_none() => {
+                magic_tour = true;
+                party_hit_tour = true;
+                autoplay = Some(
+                    options
+                        .next()
+                        .cloned()
+                        .ok_or("party hit tour capture directory absent")?,
                 );
             }
             Some(flag @ ("--gear-tour" | "--gear-tour-quick")) if autoplay.is_none() => {
@@ -10899,8 +10982,18 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
         None
     };
     // A form's change takes about 260 ticks before the first cast.
-    let magic_shift = if magic_form != 0 { 260 } else { 0 };
-    let captures = if journal_tour {
+    let magic_shift = if party_hit_tour {
+        // The magic tour's schedule never comes up.
+        1 << 40
+    } else if magic_form != 0 {
+        260
+    } else {
+        0
+    };
+    let captures = if party_hit_tour {
+        // The tour asks for its captures as its cases happen.
+        Vec::new()
+    } else if journal_tour {
         journal_tour::CAPTURES.to_vec()
     } else if npc_tour {
         NPC_TOUR_CAPTURES.to_vec()
@@ -10929,7 +11022,9 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
                 }
             })
     };
-    let autoplay_end = if journal_tour {
+    let autoplay_end = if party_hit_tour {
+        party_hit_tour::END
+    } else if journal_tour {
         journal_tour::END
     } else if npc_tour {
         NPC_TOUR_END
@@ -11042,7 +11137,7 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
                 hp: kind.hp,
                 max_hp: kind.hp,
                 mp: player::magic::Mp::new(kind.mp),
-                kind,
+                kind: kind.clone(),
                 follower: player::party_members::Follower::spawn(
                     loaded.spawn.to_array(),
                     loaded.yaw,
@@ -11054,6 +11149,12 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
                 casts: 0,
                 armed: false,
                 forced: None,
+                voices: kind.voices.clone(),
+                voice_at: (u16::MAX, 0),
+                record: combat::HitRecord::new(true),
+                ko_fx: false,
+                cast_motion: 0,
+                reflected: false,
             })
             .collect(),
         items: loaded.items.map(|src| {
@@ -11088,7 +11189,13 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
         weapon_pax_changed: false,
         weapon_display: Vec::new(),
         fx_calls: Vec::new(),
-        party_spells: true,
+        party_spells: !party_hit_tour,
+        party_battle: party_room::BattleMode::default(),
+        party_hit_tour,
+        party_hit_state: party_hit_tour::State::default(),
+        enemy_guards: Vec::new(),
+        party_volumes: Vec::new(),
+        gallery_targets: Vec::new(),
         fx_live: HashMap::new(),
         cure_target: 0,
         cure_pick: None,
@@ -11317,6 +11424,8 @@ fn run(mut args: Vec<PathBuf>) -> Result<AppExit, Box<dyn std::error::Error>> {
             sora_target: e.sora_target,
             sora_body: e.sora_body,
             target_reach: e.target_reach,
+            claws_now: Vec::new(),
+            last_attacker: party_room::Attacker::Sora,
             sora_record: combat::HitRecord::new(true),
             ids: combat::AttackIds::default(),
             instance_ids: HashMap::new(),

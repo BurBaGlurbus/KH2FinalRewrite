@@ -1828,6 +1828,7 @@ pub fn level_panels(src: &FormSources, up: &forms::LevelUp) -> Vec<visual::level
 /// Battle voices (FUN_1403d69b0 → FUN_1403cdb60): 00battle `vtbl` rows
 /// {u8 char, u8 n, u8 prio, u8 0, 5 × (i8 sound, i8 weight)} and the
 /// character's voice bank.
+#[derive(Clone)]
 pub struct Voices {
     rows: Vec<[u8; 14]>,
     bank: u16,
