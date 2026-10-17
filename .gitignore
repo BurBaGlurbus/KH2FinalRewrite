@@ -38,6 +38,7 @@
 !/source/main/examples/*.rs
 !/source/main/src/**/*.wgsl
 !/source/data/examples/*.rs
+!/source/game/*/examples/*.rs
 !/source/extras/skateboard/source/examples/*.rs
 !/source/visual/src/**/*.wgsl
 !/source/game/README.md

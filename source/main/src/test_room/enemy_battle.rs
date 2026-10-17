@@ -210,6 +210,20 @@ impl Brain {
             a.mark_attack_hit(slot);
         }
     }
+    /// Sora's guard turned a script attack back.
+    pub fn mark_script_attack_reflected(&mut self, slot: usize) {
+        if let Self::Script(a) = self {
+            a.mark_attack_reflected(slot);
+        }
+    }
+    /// The attacks a script applied to Sora directly this frame
+    /// (`attack_strike`): slot, parameter id and extra.
+    pub fn take_script_strikes(&mut self) -> Vec<(usize, i32, i32)> {
+        match self {
+            Self::Script(a) => a.take_strikes(),
+            _ => Vec::new(),
+        }
+    }
     /// The effects a script brain started this frame (none for other brains).
     pub fn take_script_effects(&mut self) -> Vec<super::enemy_script::ScriptEffect> {
         match self {

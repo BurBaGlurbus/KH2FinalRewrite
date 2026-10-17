@@ -70,11 +70,53 @@ pub struct PendingFly {
 
 /// Physics mode 5 (`trap_obj_fly`): a free velocity that follows the object's
 /// move request. The routine is FUN_140421c80 with FUN_1403b7ad0 as its
-/// steering step.
+/// steering step. Mode 6 (`trap_obj_hover`) runs the very same routine
+/// (FUN_140422900 hands over to mode 5's update) but its mode flags are 0x100,
+/// so it counts neither as a jump nor as a fly.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Steer {
     /// +0x108: the share of the velocity kept each step.
     pub inertia: f32,
+    /// Mode 6 instead of mode 5.
+    pub hover: bool,
+}
+
+/// +0x118 / +0x11c: the motions a jump plays near its apex and on landing
+/// (-1: none). Arming any jump sets (-1, 5): no fall motion, motion 5 on
+/// landing (FUN_1403cbb00, FUN_1403cbd00).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JumpMotions {
+    pub fall: i32,
+    pub land: i32,
+}
+
+impl Default for JumpMotions {
+    fn default() -> Self {
+        Self { fall: -1, land: 5 }
+    }
+}
+
+/// Physics mode 9 (`trap_obj_hop`): a ballistic hop whose vertical speed is
+/// integrated every step (FUN_1403cbdd0) and whose horizontal velocity follows
+/// the object's move request with one inertia (+0x108) for both the pull and
+/// the decay.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hop {
+    /// Horizontal velocity (x, z), Y-up frame.
+    pub velocity: [f32; 2],
+    /// +0x24: vertical speed, Y-down (negative rises).
+    pub vy_down: f32,
+    /// +0x10c: acceleration downwards per tick squared.
+    pub gravity: f32,
+    /// +0x108.
+    pub inertia: f32,
+}
+
+/// What `obj_hop` armed (FUN_1403cbec0): the hop begins when the playing
+/// motion's take-off event (frame event 0) fires, like a jump.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PendingHop {
+    pub hop: Hop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,6 +176,9 @@ pub struct Target {
     pub id: u32,
     /// Search kind it was made with (+0xc), -1 when unset.
     pub kind: i32,
+    /// The record's group word (+4; `target_set_group` / `target_get_group`,
+    /// FUN_1403bee60 writes it).
+    pub group: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -201,7 +246,7 @@ pub struct Sysobj {
     pub turn_rate: f32,
     /// `obj_set_movement`'s `+0x118/+0x11c`: the fall and land motions of the
     /// current jump.
-    pub jump_motions: Option<(usize, usize)>,
+    pub jump_motions: JumpMotions,
     /// +0x648: the physics mode the next take-off event (frame event 0) enters
     /// (1 jump, 3 fly).
     pub pending_mode: u8,
@@ -225,6 +270,10 @@ pub struct Sysobj {
     /// The object entry's id and part id (`obj_get_entry_id`, `obj_part`).
     pub entry_id: u32,
     pub entry_part: u16,
+    /// The spawn record's serial (the ushort at +0x1e of the record +0x9f0
+    /// points to; `trap_obj_search_by_serial` matches it). 0 when the object
+    /// has no spawn record.
+    pub spawn_serial: u16,
     /// +0xccc: routine option flags (`rtn_option_flag`), and +0xcd8..+0xcfc:
     /// the routine time parameters (`set_rtn_time_param`; word 7 is `touch_zone`).
     pub rtn_flags: Vec<u32>,
@@ -251,12 +300,100 @@ pub struct Sysobj {
     pub steer_moving: bool,
     /// A plain jump (FUN_1403cbb00): the arc and its horizontal velocity.
     pub(crate) jump: Option<(actor_physics::Arc, [f32; 2])>,
+    /// Physics mode 9 (hop), and the hop armed for the next take-off.
+    pub(crate) hop: Option<Hop>,
+    pub(crate) pending_hop: Option<PendingHop>,
     pub(crate) blow: Option<actor_physics::Blow>,
     pub(crate) knock: Option<actor_physics::Knock>,
     pub(crate) sampler: actor_physics::Sampler,
     pub record: combat::HitRecord,
     /// +0x18c bit 18: the act manager is paused (set by engine states).
     pub act_paused: bool,
+    /// Words of the engine object a script wrote through its handle at
+    /// offsets nothing else models (the spec block +0x128.., for one). They
+    /// read back as written; an engine reader maps its own offset to a field
+    /// above when it exists.
+    pub raw_words: std::collections::BTreeMap<u32, u32>,
+    /// +0x124: state bits (see [`state_flag`]) besides the steering bit.
+    pub state_flags: u32,
+    /// +0x6c8: the object class bits (see [`class_flag`]); the host sets them
+    /// for objects it knows are Sora, summons and so on.
+    pub class_flags: u32,
+    /// +0x8c8 bit 5: the scissoring draw state (`obj_set_scissoring`).
+    pub scissoring: bool,
+    /// +0x7e9..+0x7eb: the stealth colour (`obj_set_stealth_color`).
+    pub stealth_color: [u8; 3],
+    /// +0xd1c: the medal count (`obj_set_medal`, `obj_get_medal`).
+    pub medal: i32,
+    /// +0xd24..+0xd33: the knock-back request (`obj_hitback` writes the
+    /// direction and strength, `obj_clear_hitback` zeroes it).
+    pub hitback: [f32; 4],
+    /// +0x9d8: the object that rides this one (0 = none).
+    pub rider: u32,
+    /// +0xac0 == 1 with the entry's pirate bit: a pirate shade
+    /// (`obj_is_pirate_shade`, FUN_1403baa90).
+    pub pirate_entry: bool,
+    pub shade_state: u8,
+    /// Stop requests (+0x64c, `enemy_stop_all_start`): a stopped object does
+    /// not advance.
+    pub stop_requests: Vec<u32>,
+    /// The attacker kept for friendly fire (+0xd40, `enemy_set_attacker`).
+    pub friend_attacker: Option<u32>,
+    /// The attack type byte (ATKP +4) and the hit part (record +0x25) of the
+    /// hit being handled.
+    pub damage_attack_type: u8,
+    pub damage_parts: u8,
+    /// +0x6a0..: carried by another object (`obj_attach`, physics mode 3).
+    pub attached: Option<Attach>,
+    /// FUN_1401a7cf0 / FUN_1401a8a90: the model is hidden (`obj_hide_part`
+    /// and `obj_show_part` take a part but the routines ignore it).
+    pub model_hidden: bool,
+    /// FUN_1401a87a0 / FUN_1401a8570: the model's texture animation plays.
+    pub texture_animation: bool,
+    /// +0xaa4: the texture fade (`obj_tex_fade_start`).
+    pub tex_fade: Fade,
+}
+
+/// An object carried by another (FUN_1403d9fe0): it follows the holder's
+/// bone `bone` instead of moving on its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Attach {
+    /// The holder.
+    pub to: crate::world::ObjId,
+    /// +0x6a4 and +0x6a6.
+    pub bone: i32,
+    pub flags: u16,
+    /// The script entry and AI object the attach was given (`obj_attach`
+    /// arguments 4 and 5).
+    pub callback: Option<(i32, u32)>,
+}
+
+/// Bits of [`Sysobj::state_flags`] (+0x124).
+pub mod state_flag {
+    /// The jump mode's landing is armed (`FUN_1403cbd00` clears it).
+    pub const GROUND_ARMED: u32 = 1;
+    /// `obj_hide_shadow`.
+    pub const HIDE_SHADOW: u32 = 1 << 9;
+    /// The object `obj_search_by_glance` last picked, and one it passed over
+    /// after it had been picked.
+    pub const GLANCED: u32 = 1 << 12;
+    pub const GLANCE_LOST: u32 = 1 << 13;
+    /// `obj_is_limit` reads +0x126 bit 0.
+    pub const LIMIT: u32 = 1 << 16;
+}
+
+/// Bits of [`Sysobj::class_flags`] (+0x6c8).
+pub mod class_flag {
+    /// The enemy class: the objects `enemy_each` and `enemy_stop_all_start`
+    /// walk (+0x6c8 bit 4).
+    pub const ENEMY: u32 = 1 << 4;
+    /// `sysobj_is_zako` (+0x6c8 bit 11): an ordinary enemy rather than a
+    /// boss; the host sets it from the object entry.
+    pub const ZAKO: u32 = 1 << 11;
+    /// `sysobj_is_summon`.
+    pub const SUMMON: u32 = 1 << 22;
+    /// `sysobj_is_sora` reads +0x6cb bit 0.
+    pub const SORA: u32 = 1 << 24;
 }
 
 impl Sysobj {
@@ -331,7 +468,7 @@ impl Sysobj {
             sheet: 0,
             shadow_move: false,
             turn_rate: 0.,
-            jump_motions: None,
+            jump_motions: JumpMotions::default(),
             pending_mode: 0,
             pending_jump: None,
             effects: Vec::new(),
@@ -344,6 +481,7 @@ impl Sysobj {
             collision: Vec::new(),
             entry_id: 0,
             entry_part: 0,
+            spawn_serial: 0,
             rtn_flags: Vec::new(),
             rtn_time: [0; 9],
             scale_w: 1.,
@@ -358,11 +496,51 @@ impl Sysobj {
             steer: None,
             steer_moving: false,
             jump: None,
+            hop: None,
+            pending_hop: None,
             blow: None,
             knock: None,
             sampler: actor_physics::Sampler::default(),
             record: combat::HitRecord::new(false),
             act_paused: false,
+            raw_words: std::collections::BTreeMap::new(),
+            state_flags: 0,
+            class_flags: class_flag::ENEMY,
+            scissoring: false,
+            stealth_color: [0; 3],
+            medal: 0,
+            hitback: [0.; 4],
+            rider: 0,
+            pirate_entry: false,
+            shade_state: 0,
+            stop_requests: Vec::new(),
+            friend_attacker: None,
+            damage_attack_type: 0,
+            damage_parts: 0,
+            attached: None,
+            model_hidden: false,
+            texture_animation: false,
+            tex_fade: Fade::default(),
+        }
+    }
+
+    /// The flag word of the current physics mode (+0xc of the mode object the
+    /// executable keeps in the table at DAT_140750d30): bit 0 air, bit 1 fly,
+    /// bit 6 blow, bit 7 ground, bit 8 always. The modes this crate runs are
+    /// listed; the others are not entered here.
+    pub fn mode_flags(&self) -> u32 {
+        if self.blow.is_some() {
+            0x1c1
+        } else if self.jump.is_some() {
+            0x181
+        } else if self.hop.is_some() {
+            0x101
+        } else if self.fly.is_some() {
+            0x103
+        } else if let Some(steer) = &self.steer {
+            if steer.hover { 0x100 } else { 0x102 }
+        } else {
+            0x180
         }
     }
 
@@ -524,6 +702,11 @@ impl Sysobj {
                     self.start_jump(direction, height, speed);
                 }
             }
+            2 => {
+                if let Some(PendingHop { hop }) = self.pending_hop.take() {
+                    self.enter_hop(hop);
+                }
+            }
             3 => {
                 if let Some(launch) = self.pending_fly.take() {
                     let floor = env.floor(self.position[0], self.position[2], self.position[1]);
@@ -566,12 +749,21 @@ impl Sysobj {
             let step = self.turn_rate.max(0.) * 2.;
             self.yaw = wrap(self.yaw + delta.clamp(-step, step));
         }
+        // The texture fade runs with the frame.
+        self.tex_fade.step(1.0);
+        // A carried object does not move by itself (physics mode 3); the
+        // world places it on its holder.
+        if self.attached.is_some() {
+            return;
+        }
         if self.fly.is_some() {
             self.update_fly(clips, env);
         } else if let Some(steer) = self.steer {
             self.update_steer(steer, env);
+        } else if let Some(hop) = self.hop {
+            self.update_hop(hop, clips, env);
         } else if let Some((arc, velocity)) = self.jump {
-            self.update_jump(arc, velocity, env);
+            self.update_jump(arc, velocity, clips, env);
         } else if !reacting {
             let root = self.motion.root_step;
             let (sin, cos) = self.yaw.sin_cos();
@@ -626,16 +818,160 @@ impl Sysobj {
             direction.map(|c| c * speed)
         };
         self.velocity = [v[0], v[1], v[2], speed * speed];
-        self.jump = None;
-        self.fly = None;
-        self.pending_fly = None;
-        self.pending_mode = 0;
-        self.steer = Some(Steer { inertia });
+        self.leave_air_modes();
+        self.steer = Some(Steer {
+            inertia,
+            hover: false,
+        });
         self.sampler.reset();
         self.airborne = true;
     }
 
-    fn update_jump(&mut self, mut arc: actor_physics::Arc, mut velocity: [f32; 2], env: &dyn Env) {
+    /// `trap_obj_hover` (FUN_140422950): physics mode 6, the steering mode
+    /// with the velocity `normalize(v.xyz) * v.w`. Unlike `start_steer` it
+    /// does not mark the object airborne (the mode flags are 0x100).
+    pub fn start_hover(&mut self, v: [f32; 4], inertia: f32) {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let unit = if len != 0. {
+            [v[0] / len, v[1] / len, v[2] / len]
+        } else {
+            [v[0], v[1], v[2]]
+        };
+        self.velocity = [unit[0] * v[3], unit[1] * v[3], unit[2] * v[3], v[3] * v[3]];
+        self.leave_air_modes();
+        self.steer = Some(Steer {
+            inertia,
+            hover: true,
+        });
+        self.sampler.reset();
+    }
+
+    /// Entering a physics mode leaves the others (FUN_1403b4da0).
+    fn leave_air_modes(&mut self) {
+        self.jump = None;
+        self.hop = None;
+        self.fly = None;
+        self.pending_fly = None;
+        self.pending_hop = None;
+        self.pending_mode = 0;
+    }
+
+    /// FUN_1403cbec0 (`trap_obj_hop`): arm a hop that starts at the next
+    /// take-off event. `v` is the script's vector: heading x/z, the apex
+    /// height in y (script frame: positive rises here) and the horizontal
+    /// speed in w; `time` is how long the rise takes.
+    pub fn arm_hop(&mut self, v: [f32; 4], time: f32, inertia: f32) {
+        let (x, z) = (v[0], v[2]);
+        let len = (x * x + z * z).sqrt();
+        let dir = if len != 0. {
+            [x / len, z / len]
+        } else {
+            [x, z]
+        };
+        // FUN_1403cbec0: g = 2h / t^2, rising speed g * t (Y-down: negative).
+        let gravity = (v[1] + v[1]) / (time * time);
+        self.pending_mode = 2;
+        self.pending_hop = Some(PendingHop {
+            hop: Hop {
+                velocity: [dir[0] * v[3], dir[1] * v[3]],
+                vy_down: -(gravity * time),
+                gravity,
+                inertia,
+            },
+        });
+        self.pending_jump = None;
+        self.jump_motions = JumpMotions::default();
+        self.state_flags &= !state_flag::GROUND_ARMED;
+    }
+
+    /// Enter the hop mode now (mode 9; FUN_1403cbd30 on entry).
+    pub fn enter_hop(&mut self, hop: Hop) {
+        self.leave_air_modes();
+        self.steer = None;
+        self.hop = Some(hop);
+        self.state_flags |= state_flag::GROUND_ARMED;
+        self.sampler.reset();
+        self.airborne = true;
+    }
+
+    /// FUN_1403cbdd0, once per physics step: horizontal velocity by the
+    /// steering step (the object's move request, one inertia for pull and
+    /// decay), vertical speed by the hop's gravity capped at the spec's
+    /// maximum fall speed (+0x138). The fall motion plays five ticks before
+    /// the apex; landing plays the land motion.
+    fn update_hop(&mut self, mut hop: Hop, clips: &dyn Clips, env: &dyn Env) {
+        if self.sampler.due(self.move_speed) {
+            let dt = actor_physics::PHYSICS_STEP;
+            hop.velocity = actor_physics::steer(
+                hop.velocity,
+                [self.move_direction[0], self.move_direction[2]],
+                self.move_speed,
+                hop.inertia,
+                hop.inertia,
+            );
+            // Y-down: positive falls. The cap is a spec word scripts write;
+            // an unwritten one leaves the speed uncapped.
+            let cap = self
+                .raw_words
+                .get(&0x138)
+                .map_or(f32::INFINITY, |w| f32::from_bits(*w));
+            hop.vy_down = (dt * hop.gravity + hop.vy_down).min(cap);
+            // The vertical lane of the step is vy * dt (Y-up: negated).
+            self.sampler.store([
+                hop.velocity[0] * dt,
+                -hop.vy_down * dt,
+                hop.velocity[1] * dt,
+            ]);
+        }
+        self.hop = Some(hop);
+        let d = self.sampler.displacement();
+        self.apply_movement(d, env);
+        // FUN_1403cbe70 (mode slot 7): the fall motion, once, near the apex.
+        if self.state_flags & state_flag::GROUND_ARMED != 0
+            && self.jump_motions.fall >= 0
+            && hop.vy_down + hop.gravity * actor_physics::FALL_MOTION_LEAD >= 0.
+        {
+            self.state_flags &= !state_flag::GROUND_ARMED;
+            self.motion_change(
+                self.jump_motions.fall as usize,
+                actor_physics::MOTION_BLEND,
+                clips,
+            );
+        }
+        if let Some(floor) = env.floor(self.position[0], self.position[2], self.position[1] + 30.)
+            && self.position[1] <= floor
+            && d[1] <= 0.
+        {
+            self.position[1] = floor;
+            self.hop = None;
+            self.land(clips);
+        }
+    }
+
+    /// FUN_1403cb940 (mode slot 6): touching down plays the land motion and
+    /// returns to the ground mode.
+    fn land(&mut self, clips: &dyn Clips) {
+        self.airborne = false;
+        self.sampler = actor_physics::Sampler::default();
+        self.state_flags &= !(1 << 27);
+        let land = self.jump_motions.land;
+        if land >= 0 {
+            let slot = land as usize;
+            if land != 5 {
+                self.motion_change(slot, 0., clips);
+            } else if clips.length(slot) != 0 {
+                self.motion_start(slot, 0., clips);
+            }
+        }
+    }
+
+    fn update_jump(
+        &mut self,
+        mut arc: actor_physics::Arc,
+        mut velocity: [f32; 2],
+        clips: &dyn Clips,
+        env: &dyn Env,
+    ) {
         if self.sampler.due(0.) {
             let dt = actor_physics::PHYSICS_STEP;
             // Without a move request the take-off velocity decays (FUN_1403b7ad0).
@@ -652,14 +988,26 @@ impl Sysobj {
         self.jump = Some((arc, velocity));
         let d = self.sampler.displacement();
         self.apply_movement(d, env);
+        // FUN_1403cb680 (mode slot 7): the fall motion starts five ticks before
+        // the apex, once.
+        if self.state_flags & state_flag::GROUND_ARMED != 0
+            && self.jump_motions.fall >= 0
+            && arc.falling_motion()
+        {
+            self.state_flags &= !state_flag::GROUND_ARMED;
+            self.motion_change(
+                self.jump_motions.fall as usize,
+                actor_physics::MOTION_BLEND,
+                clips,
+            );
+        }
         if let Some(floor) = env.floor(self.position[0], self.position[2], self.position[1] + 30.)
             && self.position[1] <= floor
             && d[1] <= 0.
         {
             self.position[1] = floor;
             self.jump = None;
-            self.airborne = false;
-            self.sampler = actor_physics::Sampler::default();
+            self.land(clips);
         }
     }
 
@@ -757,6 +1105,11 @@ impl Sysobj {
     pub fn launch_jump(&mut self, direction: Vec3, height: f32, speed: f32) {
         self.pending_mode = 1;
         self.pending_jump = Some((direction, height, speed));
+        self.pending_hop = None;
+        // Arming resets the motions the jump plays near its apex and when it
+        // lands (FUN_1403cbb00): none, and motion 5.
+        self.jump_motions = JumpMotions::default();
+        self.state_flags &= !state_flag::GROUND_ARMED;
     }
 
     /// Enter the jump physics mode now.
@@ -768,10 +1121,13 @@ impl Sysobj {
             [0.; 2]
         };
         self.steer = None;
+        self.hop = None;
         self.jump = Some((
             actor_physics::Arc::launch(self.position[1], height),
             [dir[0] * speed, dir[1] * speed],
         ));
+        // FUN_1403cbd30 on entering the jump mode arms the fall motion.
+        self.state_flags |= state_flag::GROUND_ARMED;
         self.sampler.reset();
         self.airborne = true;
     }
@@ -802,6 +1158,7 @@ impl Sysobj {
     /// from the given Y-up vertical speed with no horizontal velocity.
     pub fn start_fall(&mut self, vertical_up: f32) {
         self.steer = None;
+        self.hop = None;
         self.jump = Some((
             actor_physics::Arc::fall(self.position[1], vertical_up),
             [0.; 2],
@@ -824,7 +1181,7 @@ impl Sysobj {
                 Some(self.velocity[((offset - 0x20) / 4) as usize].to_bits())
             }
             0x134 => Some(self.turn_rate.to_bits()),
-            _ => None,
+            _ => self.raw_words.get(&offset).copied(),
         }
     }
 
@@ -839,6 +1196,9 @@ impl Sysobj {
                 self.velocity[((offset - 0x20) / 4) as usize] = f32::from_bits(value)
             }
             0x134 => self.turn_rate = f32::from_bits(value),
+            _ if offset < 0x1000 && offset.is_multiple_of(4) => {
+                self.raw_words.insert(offset, value);
+            }
             _ => return false,
         }
         true
@@ -856,6 +1216,7 @@ impl Sysobj {
         self.blow = Some(actor_physics::Blow::new(velocity, &self.sstm));
         self.knock = None;
         self.jump = None;
+        self.hop = None;
         self.fly = None;
         self.steer = None;
         self.pending_fly = None;
@@ -885,7 +1246,7 @@ impl Sysobj {
     /// (+0x18c bit 6).
     pub fn is_fly(&self) -> bool {
         self.fly.is_some()
-            || self.steer.is_some()
+            || self.steer.is_some_and(|s| !s.hover)
             || self.motion.flags.word & motion::flag::HOLD != 0
     }
 
@@ -961,15 +1322,21 @@ impl Sysobj {
     /// `trap_obj_idle`: back to the ground physics mode (FUN_1403b4da0 mode 0).
     pub fn to_ground_mode(&mut self) {
         self.jump = None;
+        self.hop = None;
         self.fly = None;
         self.steer = None;
         self.pending_fly = None;
+        self.pending_hop = None;
         self.airborne = false;
         self.sampler.reset();
     }
 
-    /// `trap_obj_is_jump`: the physics state byte at +0xc bit 0.
+    /// `trap_obj_is_jump`: the physics state byte at +0xc bit 0 (jump, hop
+    /// and flyjump have it; the steering modes do not).
     pub fn is_jump(&self) -> bool {
-        self.jump.is_some() || self.fly.is_some()
+        self.jump.is_some() || self.hop.is_some() || self.fly.is_some()
     }
 }
+
+#[cfg(test)]
+mod tests;

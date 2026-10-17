@@ -79,6 +79,19 @@ pub struct Manager {
     pub has_table: bool,
     /// +0x108: the script's AI object (the first argument of its act traps).
     pub ai_object: u32,
+    /// +0x130..+0x140: a shout waiting out its random delay.
+    pub pending_shout: Option<PendingShout>,
+}
+
+/// A shout (`act_shout`) that reached an object with a delay: after the timer
+/// runs out the object calls the timeout routine of its act of that name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingShout {
+    pub name: Vec<u8>,
+    /// The shouter's AI object.
+    pub shouter: u32,
+    /// Ticks left.
+    pub timer: f32,
 }
 
 impl Default for Manager {
@@ -93,6 +106,7 @@ impl Default for Manager {
             flags: 0,
             has_table: false,
             ai_object: 0,
+            pending_shout: None,
         }
     }
 }

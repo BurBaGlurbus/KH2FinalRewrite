@@ -9,10 +9,15 @@ pub mod attack;
 pub mod homing;
 pub mod math;
 pub mod object;
+pub mod query;
+pub mod searcher;
+pub mod service;
 pub mod sheet;
 pub mod state;
 pub mod system;
 pub mod target;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
     math::lookup(table, index)
@@ -22,5 +27,8 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         .or_else(|| target::lookup(table, index))
         .or_else(|| system::lookup(table, index))
         .or_else(|| sheet::lookup(table, index))
+        .or_else(|| query::lookup(table, index))
+        .or_else(|| searcher::lookup(table, index))
+        .or_else(|| service::lookup(table, index))
         .or_else(|| state::lookup(table, index))
 }

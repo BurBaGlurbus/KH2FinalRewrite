@@ -9,10 +9,19 @@ use crate::world::{ATTACK_HANDLES, Ctx, Event, TrapFn, object_handle};
 type Args = [Slot; 16];
 
 pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
+    if table == 7 {
+        return Some(match index {
+            2 => hit_mark_pos,
+            14 => set_reaction_offset,
+            34 => set_rc_owner,
+            _ => return None,
+        });
+    }
     if table != 2 {
         return None;
     }
     Some(match index {
+        71 => set_hitmark_pos,
         10 => attack_new,
         11 => set_radius,
         12 => set_pos,
@@ -156,12 +165,23 @@ fn is_valid(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<()
     flag_result(ctx, args, |_| true)
 }
 
-/// 2:17 FUN_1404328e0: apply the attack to a target directly (FUN_1403d23c0,
-/// then the target class's damage entry). [U] Recorded; no damage is dealt.
-fn strike(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+/// 2:17 FUN_1404328e0: apply the attack to a target directly (FUN_1403d23c0
+/// makes the damage record, then the target class's damage entry takes it).
+/// The attack counts as having struck; the damage itself is the host's:
+/// the event names the attack and the target.
+fn strike(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let target = ctx.sys_of_ai(m, args[1].value).ok();
+    let handle = args[0].value;
+    let Some(slot) = index_of(handle) else {
+        return Ok(());
+    };
+    if let Some(a) = attack(ctx, handle) {
+        a.flags |= flag::STRUCK;
+    }
     ctx.world.events.push(Event::AttackStrike {
-        attack: args[0].value,
-        target: args[1].value,
+        attack: handle,
+        slot,
+        target,
         arguments: [args[2].as_int(), args[3].as_int()],
     });
     Ok(())
@@ -224,20 +244,73 @@ fn set_team(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<()
     Ok(())
 }
 
-/// 2:38 FUN_140432560: the script entry to call when the attack hits.
+/// 2:38 FUN_140432560: the script entry to call when the attack hits, with
+/// the AI object it gets. The script that registers it is the current one
+/// (DAT_142a25048); the callback runs there.
 fn set_hit_callback(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
     let (entry, ai) = (args[1].as_int(), args[2].value);
+    let me = ctx.me.id;
     if let Some(a) = attack(ctx, args[0].value) {
         a.hit_callback = Some((entry, ai));
+        a.callback_object = Some(me);
     }
     Ok(())
 }
 
-/// 2:74: the reflect callback. [U] Recorded.
-fn set_reflect_callback(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world
-        .events
-        .push(Event::Unsupported("attack_set_reflect_callback"));
+/// 2:74 FUN_140432c40: the same for a reflect (+0xa4..+0xac).
+fn set_reflect_callback(
+    ctx: &mut Ctx<'_>,
+    _: &mut Memory<'_>,
+    args: &mut Args,
+) -> Result<(), Fault> {
+    let (entry, ai) = (args[1].as_int(), args[2].value);
+    let me = ctx.me.id;
+    if let Some(a) = attack(ctx, args[0].value) {
+        a.reflect_callback = Some((entry, ai));
+        a.callback_object = Some(me);
+    }
+    Ok(())
+}
+
+/// 2:71 FUN_140432ba0 -> FUN_1403d0750: the hit mark's two vectors, the
+/// executable's globals the hit spark reads.
+fn set_hitmark_pos(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let first = read_native(ctx, m, args[0].value)?;
+    let second = read_native(ctx, m, args[1].value)?;
+    ctx.world.hit_mark = [first, second];
+    Ok(())
+}
+
+/// 7:2 FUN_14053f2c0: the hit mark's position (DAT_14074c0d8).
+fn hit_mark_pos(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let v = native(ctx.world.hit_mark[0]);
+    let cell = ctx.world.static_cell(7, 2, 0);
+    for (k, lane) in v.iter().enumerate() {
+        ctx.write_f32(m, cell + 4 * k as u32, *lane);
+    }
+    args[0] = Slot::address(cell);
+    Ok(())
+}
+
+/// 7:14 FUN_14053f300: +0x128, the offset added to the reaction direction.
+fn set_reaction_offset(
+    ctx: &mut Ctx<'_>,
+    m: &mut Memory<'_>,
+    args: &mut Args,
+) -> Result<(), Fault> {
+    let v = read_native(ctx, m, args[1].value)?;
+    if let Some(a) = attack(ctx, args[0].value) {
+        a.reaction_offset = v;
+    }
+    Ok(())
+}
+
+/// 7:34 FUN_14053fac0: +0x118, the object that owns the attack's receiver.
+fn set_rc_owner(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let owner = ctx.sys_of_ai(m, args[1].value).ok();
+    if let Some(a) = attack(ctx, args[0].value) {
+        a.rc_owner = owner;
+    }
     Ok(())
 }
 
@@ -253,23 +326,56 @@ fn hit_bg_pos(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<
 }
 
 /// 2:43 FUN_140432680 -> FUN_140437530: the direction a reflected attack
-/// returns along. [U] Reads as zero.
+/// returns along: toward its owner when the owner still exists (otherwise
+/// the way the reflecter faces), turned toward the reflecter's target when
+/// that exists.
 fn reflect_vector(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    ctx.world
-        .events
-        .push(Event::Unsupported("attack_get_reflect_vector"));
-    let cell = ctx.world.static_cell(2, 43, 0);
-    for k in 0..3 {
-        ctx.write_f32(m, cell + 4 * k, 0.);
+    let (at, owner, reflecter) = attack(ctx, args[0].value).map_or(([0.; 4], None, None), |a| {
+        (a.position, a.owner, a.reflecter)
+    });
+    let unit = |v: [f32; 3]| {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if len != 0. { v.map(|c| c / len) } else { v }
+    };
+    let mut out = [0.; 3];
+    let owner_at = owner.and_then(|id| ctx.object(id).ok().map(|o| o.sys.position));
+    if let Some(p) = owner_at {
+        out = unit([p[0] - at[0], p[1] - at[1], p[2] - at[2]]);
+    } else if let Some(id) = reflecter {
+        let yaw = if id == crate::world::PLAYER_OBJECT {
+            ctx.env.player_yaw()
+        } else {
+            ctx.object(id).map_or(0., |o| o.sys.yaw)
+        };
+        out = [yaw.sin(), 0., yaw.cos()];
     }
-    ctx.write_f32(m, cell + 12, 1.);
+    // The reflecter's own target bends it.
+    let target = reflecter.and_then(|id| {
+        if id == crate::world::PLAYER_OBJECT {
+            ctx.env
+                .lockon_target()
+                .and_then(|t| ctx.env.target_position(t))
+        } else {
+            let t = ctx.object(id).ok()?.sys.target;
+            super::target::target_point(ctx, t)
+        }
+    });
+    if let Some(p) = target {
+        let toward = unit([p[0] - at[0], p[1] - at[1], p[2] - at[2]]);
+        out = unit([out[0] + toward[0], out[1] + toward[1], out[2] + toward[2]]);
+    }
+    let cell = ctx.world.static_cell(2, 43, 0);
+    for (k, lane) in [out[0], -out[1], out[2], 1.0].iter().enumerate() {
+        ctx.write_f32(m, cell + 4 * k as u32, *lane);
+    }
     args[0] = Slot::address(cell);
     Ok(())
 }
 
-/// 2:44 FUN_140432750: the object that reflected it (+0x90). [U] None.
-fn reflecter(_: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    args[0] = Slot::address(0);
+/// 2:44 FUN_140432750: the object that reflected it (+0x90), 0 for none.
+fn reflecter(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let id = attack(ctx, args[0].value).and_then(|a| a.reflecter);
+    args[0] = Slot::address(id.map_or(0, object_handle));
     Ok(())
 }
 

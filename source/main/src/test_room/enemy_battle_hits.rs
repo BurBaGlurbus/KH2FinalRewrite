@@ -36,6 +36,8 @@ struct Candidate {
     atkp: u16,
     sub: u8,
     script_slot: Option<usize>,
+    /// Applied by `attack_strike`: no hit callback runs for it.
+    direct: bool,
     shapes: Vec<(u8, usize, Vec3, f32, Option<Vec3>)>,
 }
 
@@ -487,6 +489,7 @@ pub fn tick(game: &mut Game, actors: &mut [GalleryActor], tick: u64) {
                 atkp: w.id,
                 sub: 0,
                 script_slot: None,
+                direct: false,
                 shapes: battle
                     .pose
                     .attacks
@@ -501,11 +504,16 @@ pub fn tick(game: &mut Game, actors: &mut [GalleryActor], tick: u64) {
             let (Ok(id), Ok(sub)) = (u16::try_from(a.id), u8::try_from(a.extra.max(0))) else {
                 continue;
             };
+            // The attack's team mask has to include Sora's team.
+            if !a.hits_sora {
+                continue;
+            }
             candidates.push(Candidate {
                 window: SCRIPT_WINDOW + a.serial as usize,
                 atkp: id,
                 sub,
                 script_slot: Some(a.slot),
+                direct: false,
                 shapes: vec![(
                     3,
                     0,
@@ -513,6 +521,25 @@ pub fn tick(game: &mut Game, actors: &mut [GalleryActor], tick: u64) {
                     a.radius,
                     a.previous.map(Vec3::from_array),
                 )],
+            });
+        }
+        // An attack a script applied to Sora directly (`attack_strike`) lands
+        // on her first body sphere without a sweep.
+        for (slot, id, extra) in battle.brain.take_script_strikes() {
+            let (Ok(id), Ok(sub), Some(&(body, ..))) = (
+                u16::try_from(id),
+                u8::try_from(extra.max(0)),
+                sora_body.first(),
+            ) else {
+                continue;
+            };
+            candidates.push(Candidate {
+                window: SCRIPT_WINDOW + 0x8000 + slot,
+                atkp: id,
+                sub,
+                script_slot: Some(slot),
+                direct: true,
+                shapes: vec![(3, 0, body, 0., None)],
             });
         }
         for cand in &candidates {
@@ -573,6 +600,9 @@ pub fn tick(game: &mut Game, actors: &mut [GalleryActor], tick: u64) {
                             rt.sora_record.mark(ids.0);
                             player.connected = true;
                             reflected = true;
+                            if let Some(slot) = cand.script_slot {
+                                battle.brain.mark_script_attack_reflected(slot);
+                            }
                             if let Some(key) = guard.magic
                                 && let Some(m) = magic.as_mut()
                             {
@@ -641,7 +671,7 @@ pub fn tick(game: &mut Game, actors: &mut [GalleryActor], tick: u64) {
                             high,
                             w_id,
                             (centre, body, body_radius),
-                            cand.script_slot,
+                            cand.script_slot.filter(|_| !cand.direct),
                         ));
                     }
                 }

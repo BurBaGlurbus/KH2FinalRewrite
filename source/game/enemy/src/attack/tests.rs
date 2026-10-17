@@ -80,18 +80,34 @@ fn a_timed_shape_keeps_the_attack_radius_for_unset_ends() {
 }
 
 #[test]
-fn a_timed_shape_grows_between_its_radii_and_the_team_mask_gates_targets() {
+fn a_timed_shape_eases_from_its_start_radii_to_the_attacks_own() {
     let mut a = Attack::new(None, 0, 0, 0, 2);
-    a.set_radius(10., 10.);
+    a.set_radius(30., 50.);
+    assert_eq!(a.current_radii(), (30., 50.));
+    a.set_time(4., 10., 20.);
+    // Time 0: the start pair; the sphere tests with the smaller radius.
+    assert_eq!(a.current_radii(), (10., 20.));
     assert_eq!(a.current_radius(), 10.);
-    a.set_time(4., 10., 30.);
-    a.advance(1.);
-    assert_eq!(a.current_radius(), 15.);
-    for _ in 0..10 {
-        a.advance(1.);
-    }
-    assert_eq!(a.current_radius(), 30., "growth stops at the duration");
+    // A quarter sine: half way through the time it is sin(pi / 4) there.
+    assert!(!a.advance(2.));
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    let (r0, r1) = a.current_radii();
+    assert!((r0 - (10. * (1. - s) + 30. * s)).abs() < 1.0e-4);
+    assert!((r1 - (20. * (1. - s) + 50. * s)).abs() < 1.0e-4);
+    // The last tick reaches the own pair; one more and the attack is freed.
+    assert!(!a.advance(2.));
+    let (r0, r1) = a.current_radii();
+    assert!((r0 - 30.).abs() < 1.0e-4 && (r1 - 50.).abs() < 1.0e-4);
+    assert!(
+        a.advance(1.),
+        "the executable frees a timed attack past its time"
+    );
+}
+
+#[test]
+fn the_team_mask_gates_targets() {
     // Team 2 attacks: bit 2 and bit 0 are excluded.
+    let a = Attack::new(None, 0, 0, 0, 2);
     assert!(a.can_hit_team(1));
     assert!(!a.can_hit_team(2));
     assert!(!a.can_hit_team(0));

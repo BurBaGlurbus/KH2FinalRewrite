@@ -57,6 +57,20 @@ pub struct Attack {
     /// +0x98..+0xa0: the script entry called when it hits, and the AI object
     /// it runs on.
     pub hit_callback: Option<(i32, u32)>,
+    /// +0xa4..+0xac: the same for a reflect.
+    pub reflect_callback: Option<(i32, u32)>,
+    /// The object whose script registered the callbacks (the executable keeps
+    /// the script instance, DAT_142a25048, in +0x98 / +0xa4).
+    pub callback_object: Option<ObjId>,
+    /// +0x90: what reflected it (Sora is [`crate::world::PLAYER_OBJECT`]).
+    pub reflecter: Option<ObjId>,
+    /// +0xb0: how many times a guard turned it back.
+    pub reflect_count: u8,
+    /// +0x118: the object that owns its receiver (`attack_set_rc_owner`).
+    pub rc_owner: Option<ObjId>,
+    /// +0x128: the offset added to the reaction's direction
+    /// (`attack_set_reaction_offset`), in the engine's +Y-up frame.
+    pub reaction_offset: [f32; 4],
     /// +0xc8: the effect handle attached to the volume.
     pub effect: u32,
     /// +0x28: the engine object whose PAX container supplies its effects.
@@ -92,6 +106,12 @@ impl Attack {
             team: 0,
             team_mask: 0,
             hit_callback: None,
+            reflect_callback: None,
+            callback_object: None,
+            reflecter: None,
+            reflect_count: 0,
+            rc_owner: None,
+            reaction_offset: [0.; 4],
             effect: 0,
             pax_object: None,
             receiver: 0,
@@ -136,6 +156,12 @@ impl Attack {
         self.flags = self.flags & !flag::LINE | flag::HAS_POSITION;
     }
 
+    /// FUN_1404376b0: an attack bound to an effect takes the effect's
+    /// position, the way `set_position` takes a script's.
+    pub fn follow(&mut self, p: [f32; 3], frame_time: f32) {
+        self.set_position([p[0], p[1], p[2], 1.], frame_time);
+    }
+
     /// FUN_140437a40: a line from `start` to `end`.
     pub fn set_line(&mut self, start: [f32; 4], end: [f32; 4]) {
         self.position = start;
@@ -154,23 +180,38 @@ impl Attack {
         ];
     }
 
-    /// The radius now: a timed shape grows from its first to its second radius
-    /// over its duration, otherwise the attack's own first radius.
-    pub fn current_radius(&self) -> f32 {
-        let [elapsed, duration, r0, r1] = self.time;
+    /// The two radii now (FUN_1404376b0): a timed shape starts at the pair
+    /// `attack_set_time` gave and grows to the attack's own pair along a
+    /// quarter sine of its elapsed share of the duration; otherwise the
+    /// attack's own pair.
+    pub fn current_radii(&self) -> (f32, f32) {
+        let [elapsed, duration, a, b] = self.time;
         if duration > 0. {
-            let t = (elapsed / duration).clamp(0., 1.);
-            r0 + (r1 - r0) * t
+            let s = (elapsed / duration * std::f32::consts::PI * 0.5).sin();
+            // FUN_140141ae0(out, own, start, s) = start * (1 - s) + own * s.
+            (
+                a * (1. - s) + self.radius.0 * s,
+                b * (1. - s) + self.radius.1 * s,
+            )
         } else {
-            self.radius.0
+            self.radius
         }
     }
 
-    /// One frame of a timed shape.
-    pub fn advance(&mut self, frame_time: f32) {
+    /// The radius of the sphere it tests with: the smaller of the two.
+    pub fn current_radius(&self) -> f32 {
+        let (a, b) = self.current_radii();
+        a.min(b)
+    }
+
+    /// One frame of a timed shape; true once its duration has passed and the
+    /// executable frees the attack (FUN_1403d0eb0).
+    pub fn advance(&mut self, frame_time: f32) -> bool {
         if self.time[1] > 0. {
             self.time[0] += frame_time;
+            return self.time[1] < self.time[0];
         }
+        false
     }
 
     /// Whether the attack can hit a target of `team` (the team mask).

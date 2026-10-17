@@ -142,6 +142,90 @@ impl Object {
         }
     }
 
+    /// Run a script entry on a throw-away thread of this object (the
+    /// executable's FUN_1403e2000 with three AI object arguments).
+    fn run_callback(&mut self, world: &mut World, env: &dyn Env, entry: i32, args: &[Slot]) {
+        let mut t = Thread::with_sizes(
+            self.script.stack_bytes,
+            self.script.temp_bytes,
+            EVENT_SLOT,
+            entry,
+            args,
+        );
+        run_thread(world, env, self, &mut t);
+    }
+
+    /// An attack this object's script made struck `victim` (FUN_1403d1730):
+    /// the attack records the strike, and the script's hit callback runs with
+    /// the AI object it was registered with, the victim and the attack. The
+    /// callback runs on `self`; an attack registered by another object calls
+    /// that object's script instead.
+    pub fn attack_struck(&mut self, world: &mut World, env: &dyn Env, slot: usize, victim: ObjId) {
+        let Some(Some(a)) = world.attacks.get_mut(slot) else {
+            return;
+        };
+        a.flags |= crate::attack::flag::STRUCK;
+        let (callback, by) = (a.hit_callback, a.callback_object);
+        let Some((entry, ai)) = callback else {
+            return;
+        };
+        let args = [
+            Slot::address(ai),
+            Slot::address(object_handle(victim)),
+            Slot::address(crate::world::ATTACK_HANDLES + 0x100 * slot as u32),
+        ];
+        self.run_callback_of(world, env, by, entry, &args);
+    }
+
+    /// A guard turned the attack back (FUN_1403d2140): it is marked reflected
+    /// by `reflecter`, and the reflect callback runs with the AI object it
+    /// was registered with, the attack and the reflecter.
+    pub fn attack_reflected(
+        &mut self,
+        world: &mut World,
+        env: &dyn Env,
+        slot: usize,
+        reflecter: ObjId,
+    ) {
+        let Some(Some(a)) = world.attacks.get_mut(slot) else {
+            return;
+        };
+        a.reflect_count = a.reflect_count.wrapping_add(1);
+        a.flags |= crate::attack::flag::REFLECTED;
+        a.reflecter = Some(reflecter);
+        let (callback, by) = (a.reflect_callback, a.callback_object);
+        let Some((entry, ai)) = callback else {
+            return;
+        };
+        let args = [
+            Slot::address(ai),
+            Slot::address(crate::world::ATTACK_HANDLES + 0x100 * slot as u32),
+            Slot::address(object_handle(reflecter)),
+        ];
+        self.run_callback_of(world, env, by, entry, &args);
+    }
+
+    /// Run a callback on the object that registered it: `self`, or one of the
+    /// world's.
+    fn run_callback_of(
+        &mut self,
+        world: &mut World,
+        env: &dyn Env,
+        by: Option<ObjId>,
+        entry: i32,
+        args: &[Slot],
+    ) {
+        match by {
+            Some(id) if id != self.id => {
+                if let Some(mut other) = world.objects.get_mut(id as usize).and_then(Option::take) {
+                    other.run_callback(world, env, entry, args);
+                    world.objects[id as usize] = Some(other);
+                }
+            }
+            _ => self.run_callback(world, env, entry, args),
+        }
+    }
+
     /// One frame of this object's script (FUN_1403b4460).
     pub fn tick_script(&mut self, world: &mut World, env: &dyn Env) {
         let Some(mut main) = self.script.main.take() else {
@@ -156,10 +240,33 @@ impl Object {
         }
     }
 
+    /// A shout reached this object (FUN_1403ca950): if its act table has an
+    /// act of that name, the act's timeout routine runs with this object's AI
+    /// object and the shouter's.
+    pub fn deliver_shout(&mut self, world: &mut World, env: &dyn Env, name: &[u8], shouter: u32) {
+        let Some(index) = self.acts.find(name) else {
+            return;
+        };
+        let timeout = self.acts.table[index].timeout;
+        if timeout == 0 {
+            return;
+        }
+        let args = [Slot::address(self.acts.ai_object), Slot::address(shouter)];
+        self.run_callback(world, env, i32::from(timeout), &args);
+    }
+
     /// FUN_1403ca550.
     fn tick_acts(&mut self, world: &mut World, env: &dyn Env) {
         if !self.acts.has_table {
             return;
+        }
+        // A shout that came with a delay arrives when its timer runs out.
+        if let Some(pending) = self.acts.pending_shout.as_mut() {
+            pending.timer -= world.frame_time;
+            if pending.timer <= 0. {
+                let done = self.acts.pending_shout.take().expect("pending shout");
+                self.deliver_shout(world, env, &done.name, done.shouter);
+            }
         }
         self.acts.flags |= act::JUST_STARTED;
         let mut highest = 0u16;
@@ -277,3 +384,6 @@ impl Object {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -9,7 +9,7 @@
 use super::math::{read_native, read_sanitized, wrap_angle};
 use crate::act::Entry;
 use crate::script::{Fault, Memory, Slot};
-use crate::sysobj::PendingFly;
+use crate::sysobj::{JumpMotions, PendingFly};
 use crate::world::{Ctx, Event, SysRef, TrapFn};
 
 type Args = [Slot; 16];
@@ -347,7 +347,10 @@ fn jump(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fa
     obj.sys
         .motion_start(slot.max(0) as usize, blend, env.clips(obj.sys.model));
     if auto != 0 {
-        obj.sys.jump_motions = Some((slot as usize + 1, slot as usize + 2));
+        obj.sys.jump_motions = JumpMotions {
+            fall: slot + 1,
+            land: slot + 2,
+        };
     }
     Ok(())
 }
@@ -628,20 +631,25 @@ fn fly_jump(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<()
     obj.sys
         .motion_start(slot.max(0) as usize, blend, env.clips(obj.sys.model));
     if auto != 0 {
-        obj.sys.jump_motions = Some((slot as usize + 1, slot as usize + 2));
+        obj.sys.jump_motions = JumpMotions {
+            fall: slot + 1,
+            land: slot + 2,
+        };
     }
     Ok(())
 }
 
 /// 1:171 FUN_140430820: `DAT_142a11400` bit 2.
 fn status_no_leave(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    int(args, ctx.env.no_leave() as i32);
+    let set = ctx.env.no_leave() || ctx.world.status & crate::world::status::NO_LEAVE != 0;
+    int(args, set as i32);
     Ok(())
 }
 
 /// 1:206 FUN_140430880: `DAT_142a11400` bit 7.
 fn status_force_leave(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    int(args, ctx.env.force_leave() as i32);
+    let set = ctx.env.force_leave() || ctx.world.status & crate::world::status::FORCE_LEAVE != 0;
+    int(args, set as i32);
     Ok(())
 }
 
@@ -769,10 +777,23 @@ fn idle(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fa
     Ok(())
 }
 
-/// 1:90 FUN_14042f960 -> FUN_1403cacd0: ask another object's act manager to
-/// start an act. [U] The cross-object shout queue is recorded only.
-fn act_shout(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("act_shout"));
+/// 1:90 FUN_14042f960 -> FUN_1403cacd0: shout an act name to every object.
+/// The shout waits in a queue of 64 (a full queue drops it) until the
+/// frame's shout job (FUN_1403c9d40, [`World::deliver_shouts`]) hands it on;
+/// a positive delay spreads the receivers over that many ticks at random.
+fn act_shout(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let name = m
+        .string(args[1].value, 128)
+        .ok_or(Fault::Memory(args[1].value))?;
+    let shouter = ctx.sys_of_ai(m, args[0].value)?;
+    let delay = args[2].as_float();
+    if ctx.world.shouts.len() < crate::world::SHOUT_QUEUE {
+        ctx.world.shouts.push(crate::world::Shout {
+            name,
+            shouter,
+            delay,
+        });
+    }
     Ok(())
 }
 

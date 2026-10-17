@@ -135,6 +135,73 @@ fn starting_a_motion_clears_the_end_pulse_of_the_previous_one() {
     assert!(!s.motion_ended(), "a new motion has not ended yet");
 }
 
+#[test]
+fn searches_bind_the_ai_object_to_the_first_match() {
+    let mut world = World::default();
+    let mut me = Object::bare(0);
+    let mut partner = Object::bare(1);
+    partner.sys.entry_id = 2140;
+    partner.sys.entry_part = 13;
+    partner.sys.spawn_serial = 94;
+    partner.sys.spawn_args[2] = 77;
+    world.objects = vec![None, Some(Box::new(partner))];
+    let by_entry = crate::traps::lookup(1, 114).unwrap();
+    let by_serial = crate::traps::lookup(1, 143).unwrap();
+    let by_part = crate::traps::lookup(1, 210).unwrap();
+    let by_unit = crate::traps::lookup(1, 292).unwrap();
+    // The AI struct is at work word 0; its word 1 receives the handle.
+    let bound = |world: &mut World, me: &mut Object, f: crate::world::TrapFn, a: i32, b: i32| {
+        let mut header = vec![0u8; 44];
+        header[..4].copy_from_slice(b"test");
+        header[16..20].copy_from_slice(&64u32.to_le_bytes());
+        header[20..24].copy_from_slice(&64u32.to_le_bytes());
+        header[24..28].copy_from_slice(&64u32.to_le_bytes());
+        let mut inst = crate::script::Instance::new(0, &header).unwrap();
+        let mut th = crate::script::Thread::new(&inst, 0, 0, &[]);
+        let base = inst.work_base();
+        let mut memory = Memory::new(&mut inst, &mut th);
+        memory.write_u32(base + 4, 0xdead);
+        let mut args = [Slot::default(); 16];
+        args[0] = Slot::address(base);
+        args[1] = Slot::int(a);
+        args[2] = Slot::int(b);
+        let mut ctx = Ctx {
+            world,
+            me,
+            env: &NullEnv,
+        };
+        f(&mut ctx, &mut memory, &mut args).unwrap();
+        memory.read_u32(base + 4).unwrap()
+    };
+    let handle = crate::world::object_handle(1);
+    assert_eq!(bound(&mut world, &mut me, by_entry, 2140, 0), handle);
+    assert_eq!(
+        bound(&mut world, &mut me, by_entry, 2141, 0),
+        0,
+        "a miss binds nothing"
+    );
+    assert_eq!(
+        bound(&mut world, &mut me, by_entry, 0x236, 0),
+        crate::world::PLAYER_HANDLE,
+        "Sora's entry id answers the player"
+    );
+    assert_eq!(bound(&mut world, &mut me, by_serial, 94, 0), handle);
+    assert_eq!(
+        bound(&mut world, &mut me, by_serial, 0, 0),
+        0,
+        "0 means serial 0x70"
+    );
+    assert_eq!(bound(&mut world, &mut me, by_part, 13, 0), handle);
+    assert_eq!(bound(&mut world, &mut me, by_unit, 2, 77), handle);
+    assert_eq!(bound(&mut world, &mut me, by_unit, 1, 77), 0);
+    world.objects[1].as_mut().unwrap().sys.flags = 0x0008_0000;
+    assert_eq!(
+        bound(&mut world, &mut me, by_part, 13, 0),
+        0,
+        "flagged objects are skipped by the list walk"
+    );
+}
+
 /// Run a trap on object 0 (a bare object) whose AI struct is at work word 0
 /// and whose first argument vector lives at word 8.
 fn run(

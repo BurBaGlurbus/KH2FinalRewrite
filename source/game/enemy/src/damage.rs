@@ -65,6 +65,8 @@ impl Object {
         let sys = &mut self.sys;
         sys.hp = (sys.hp - damage).max(0);
         sys.damage_reaction = u32::from(attack.reaction);
+        sys.damage_element = attack.element;
+        sys.damage_attack_type = attack.attack_type;
         sys.last_attacker = Some(PLAYER_TARGET);
         let back = sys.yaw.sin() * direction[0] + sys.yaw.cos() * direction[2] >= 0.;
         let class = combat::reaction_class(attack.reaction);
@@ -84,6 +86,8 @@ impl Object {
             ));
             sys.knock = None;
             sys.jump = None;
+            sys.hop = None;
+            sys.steer = None;
             sys.fly = None;
             sys.pending_fly = None;
             sys.sampler.reset();

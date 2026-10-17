@@ -14,7 +14,6 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (1, 53) => disable_collision,
         (1, 54) => reset_collision,
         (1, 97) => spec,
-        (1, 109) => hide_part,
         (1, 114) => search_by_entry,
         (1, 177) => set_path,
         (1, 222) => get_entry_id,
@@ -29,6 +28,7 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (1, 141) => bg_ground_pos,
         (1, 153) => reset_pos,
         (1, 156) => obj_hop,
+        (6, 42) => obj_hop_direct,
         (1, 172) => can_look,
         (1, 174) => look_start,
         (1, 176) => look_end,
@@ -36,8 +36,6 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (4, 6) => mission_increment_count,
         (4, 9) => mission_add_gauge,
         (4, 48) => mission_set_count_figure,
-        (6, 8) => searcher_add,
-        (6, 16) => searcher_clear,
         (0, 49) => effect_is_alive,
         (1, 0) => sysobj_appear,
         (1, 24) => area_area,
@@ -47,8 +45,6 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (1, 48) => message_is_end,
         (1, 76) => motion_unhook,
         (1, 93) => sysobj_party,
-        (1, 102) => obj_detach,
-        (1, 125) => tex_fade_start,
         (1, 129) => obj_blow,
         (1, 155) => add_hp,
         (1, 166) => target_attack,
@@ -68,9 +64,6 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (2, 3) => exec_damage_hitback,
         (2, 6) => is_damage_motion,
         (2, 7) => damage_reaction,
-        (2, 77) => vacuum_create,
-        (2, 78) => vacuum_destroy,
-        (2, 79..=84) => vacuum_set,
         (2, 85) => damage_element,
         (2, 86) => damage_get_hitback,
         (2, 87) => exec_damage_large,
@@ -80,11 +73,9 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (4, 40) => mission_timer,
         (5, 3) => path_dir,
         (6, 2) => player_get_form,
-        (6, 3) => searcher_init,
         (6, 53) => bghit_is_hit,
         (6, 55) => bghit_get_kind,
         (1, 1) => set_rot,
-        (1, 18) => obj_attach,
         (1, 21) => effect_start,
         (1, 22) => effect_start_pos,
         (1, 52) => enable_collision,
@@ -93,7 +84,6 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (1, 149) => effect_start_bind_other,
         (1, 157) => obj_camera_start,
         (1, 165) => command_override,
-        (1, 184) => light_fadeout,
         (0, 32) => screen_whitein,
         (1, 160) => target_set_obj,
         (1, 170) => unit_group,
@@ -116,16 +106,12 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         (2, 45) => damage_attack_param_id,
         (1, 75) => motion_hook,
         (1, 77) => motion_is_hook,
-        (1, 85) | (1, 86) => texanm,
         (1, 101) => motion_is_capture,
-        (1, 108) => show_part,
-        (1, 143) | (1, 210) => search_object,
+        (1, 143) => search_by_serial,
+        (1, 210) => search_by_part,
         (1, 145) => touch_zone,
         (1, 148) => set_pos,
-        (1, 161) => is_attach,
         (1, 162) => target_set_before_player,
-        (1, 181) => light_create,
-        (1, 182) | (1, 183) => light_set,
         (1, 213) => obj_part,
         (1, 218) => set_unit_arg,
         (1, 247) => bg_random_pos,
@@ -177,20 +163,73 @@ fn spec(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fa
     Ok(())
 }
 
-/// 1:109 FUN_14042fd40 -> FUN_1403cc9b0 (the object at +0x7b0). [U] Recorded
-/// only.
-fn hide_part(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("obj_hide_part"));
-    Ok(())
+/// Note a search in the trace (development aid) and bind its result.
+fn finish_search(
+    ctx: &mut Ctx<'_>,
+    m: &mut Memory<'_>,
+    ai: u32,
+    kind: &'static str,
+    value: i32,
+    index: i32,
+    found: Option<crate::world::ObjId>,
+) -> Result<(), Fault> {
+    if ctx.world.trace.is_some() && ctx.world.searches.len() < 256 {
+        ctx.world.searches.push(crate::world::SearchRecord {
+            kind,
+            value,
+            index,
+            found: found.is_some(),
+        });
+    }
+    ctx.bind_ai(m, ai, found)
 }
 
 /// 1:114 FUN_14042ddb0 -> FUN_1403b4110: bind the AI object to the engine
-/// object found by entry id. [U] Recorded only; the binding is left alone.
-fn search_by_entry(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world
-        .events
-        .push(Event::Unsupported("obj_search_by_entry"));
-    Ok(())
+/// object whose entry is the given object id (0x236 is Sora). A miss binds
+/// nothing (+4 becomes 0).
+fn search_by_entry(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let entry = args[1].value;
+    let found = if entry == crate::world::PLAYER_ENTRY {
+        Some(crate::world::PLAYER_OBJECT)
+    } else {
+        ctx.search(|o| o.sys.entry_id == entry)
+    };
+    finish_search(ctx, m, args[0].value, "entry", entry as i32, 0, found)
+}
+
+/// 1:143 FUN_14042ddf0 -> FUN_1403b41e0: the object whose spawn record serial
+/// (the ushort at +0x1e) equals the argument, 0x70 when the argument is 0.
+/// Objects without a spawn record read as serial 0.
+fn search_by_serial(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let serial = if args[1].value == 0 {
+        0x70
+    } else {
+        args[1].value
+    };
+    let found = ctx.search(|o| u32::from(o.sys.spawn_serial) == serial);
+    finish_search(ctx, m, args[0].value, "serial", serial as i32, 0, found)
+}
+
+/// 1:210 FUN_14042de30 -> FUN_1403b4180: the object whose entry part id
+/// (+0x4c) equals the argument.
+fn search_by_part(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let part = args[1].value;
+    let found = ctx.search(|o| u32::from(o.sys.entry_part) == part);
+    finish_search(ctx, m, args[0].value, "part", part as i32, 0, found)
+}
+
+/// 1:292 FUN_14042de70: the object whose unit argument `index` (+0x9f4 + 4 *
+/// index) equals the value. The executable does not bound `index`; a script
+/// index past the stored arguments reads as no match.
+fn search_by_unit_arg(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let (index, value) = (args[1].as_int(), args[2].as_int());
+    let found = ctx.search(|o| {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| o.sys.spawn_args.get(i))
+            .is_some_and(|a| *a == value)
+    });
+    finish_search(ctx, m, args[0].value, "unit_arg", value, index, found)
 }
 
 /// 1:177 FUN_14042d8e0 -> FUN_1403b9de0: bind a path to the object. [U]
@@ -277,31 +316,11 @@ fn motion_is_hook(_: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Resul
     Ok(())
 }
 
-/// 1:85 and 1:86 FUN_14042f820 / FUN_14042f850: texture animation start and
-/// stop. [U] Recorded.
-fn texanm(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("obj_texanm"));
-    Ok(())
-}
-
 /// 1:101 FUN_14042d360: +0x18c bit 14 (a captured motion plays).
 fn motion_is_capture(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
     let id = ctx.sys_of_ai(m, args[0].value)?;
     let bit = ctx.object(id)?.sys.motion.flags.word >> 14 & 1;
     args[0] = Slot::int(bit as i32);
-    Ok(())
-}
-
-/// 1:108 FUN_14042fd10 -> FUN_1403cd810: show a model part. [U] Recorded.
-fn show_part(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("obj_show_part"));
-    Ok(())
-}
-
-/// 1:143 and 1:210 FUN_14042ddf0 / FUN_14042de30: bind the AI object to the
-/// engine object with a serial or part id. [U] Recorded; the binding is kept.
-fn search_object(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("obj_search"));
     Ok(())
 }
 
@@ -321,12 +340,6 @@ fn set_pos(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(),
     Ok(())
 }
 
-/// 1:161 FUN_14042b980: an attached object exists (+0x6a0). [U] Always 0.
-fn is_attach(_: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    args[0] = Slot::int(0);
-    Ok(())
-}
-
 /// 1:162 FUN_1404304b0 -> FUN_1403bd410. [U] Recorded.
 fn target_set_before_player(
     ctx: &mut Ctx<'_>,
@@ -336,20 +349,6 @@ fn target_set_before_player(
     ctx.world
         .events
         .push(Event::Unsupported("target_set_before_player"));
-    Ok(())
-}
-
-/// 1:181 FUN_140430950: create a light. [U] Recorded; a placeholder handle.
-fn light_create(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("light_create"));
-    let handle = ctx.world.next_magic_handle();
-    args[0] = Slot::address(handle);
-    Ok(())
-}
-
-/// 1:182 and 1:183: light flag and colour. [U] Recorded.
-fn light_set(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("light_set"));
     Ok(())
 }
 
@@ -485,17 +484,13 @@ fn motion_speed(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Resul
 /// of the current jump (+0x118, +0x11c).
 fn set_fall_motion(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
     let id = ctx.sys_of_ai(m, args[0].value)?;
-    let slot = args[1].as_int().max(0) as usize;
-    let motions = ctx.object(id)?.sys.jump_motions.get_or_insert((0, 0));
-    motions.0 = slot;
+    ctx.object(id)?.sys.jump_motions.fall = args[1].as_int();
     Ok(())
 }
 
 fn set_land_motion(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
     let id = ctx.sys_of_ai(m, args[0].value)?;
-    let slot = args[1].as_int().max(0) as usize;
-    let motions = ctx.object(id)?.sys.jump_motions.get_or_insert((0, 0));
-    motions.1 = slot;
+    ctx.object(id)?.sys.jump_motions.land = args[1].as_int();
     Ok(())
 }
 
@@ -503,13 +498,6 @@ fn set_land_motion(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Re
 /// [U] Recorded; the script gets nothing.
 fn obj_hook(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
     ctx.world.events.push(Event::Unsupported("obj_hook"));
-    Ok(())
-}
-
-/// 1:18 FUN_14042c550 -> FUN_1403d9fe0: attach one object to another (a grab).
-/// [U] Recorded.
-fn obj_attach(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("obj_attach"));
     Ok(())
 }
 
@@ -579,11 +567,19 @@ unsupported_vector_traps! {
     bg_press = (6, 24, "obj_get_bg_press");
 }
 
-/// 1:0 FUN_14042b130 -> FUN_1403df930: `sysobj_appear`, look up or make an
-/// object appear. [U] Recorded; the script gets a null object.
+/// 1:0 FUN_14042b130 -> FUN_1403df930: `sysobj_appear`, make an object of the
+/// entry appear (at the routine's default position; scripts place it
+/// afterwards). The host's [`crate::world::Spawner`] builds it; without one,
+/// or when it declines, the script gets a null object (the executable returns
+/// 0 for an entry it cannot make).
 fn sysobj_appear(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("sysobj_appear"));
-    args[0] = Slot::address(0);
+    let entry = args[0].value & 0x0fff_ffff;
+    let me = ctx.me.id;
+    let id = ctx.world.appear(ctx.env, me, entry);
+    if id.is_none() {
+        ctx.world.events.push(Event::Unsupported("sysobj_appear"));
+    }
+    args[0] = Slot::address(id.map_or(0, object_handle));
     Ok(())
 }
 
@@ -697,10 +693,12 @@ fn target_set_obj(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Res
         crate::world::SysRef::Player => crate::sysobj::Target {
             id: super::target::PLAYER_TARGET,
             kind: -1,
+            group: 0,
         },
         crate::world::SysRef::Object(id) => crate::sysobj::Target {
             id: super::target::OBJECT_TARGET | id,
             kind: -1,
+            group: 0,
         },
     };
     super::target::set_record(ctx, handle, t)
@@ -765,13 +763,21 @@ fn bghit_check_line(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> R
         [v[0], v[1], v[2]]
     };
     let hit = ctx.env.line_blocked(a, b);
+    ctx.world.last_line_cross = hit.then(|| ctx.env.line_hit(a, b)).flatten();
     args[0] = Slot::int(hit as i32);
     Ok(())
 }
 
-/// 6:54 FUN_14053ed00: where the last line check crossed the map. [U] Zero.
+/// 6:54 FUN_14053ed00: where the last line check crossed the map (zero when
+/// it did not).
 fn bghit_cross_pos(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    unsupported_vector(ctx, m, args, 6, 54, "bghit_get_cross_pos")
+    let at = ctx.world.last_line_cross.unwrap_or([0.; 3]);
+    let cell = ctx.world.static_cell(6, 54, 0);
+    for (k, lane) in [at[0], -at[1], at[2], 1.0].iter().enumerate() {
+        ctx.write_f32(m, cell + 4 * k as u32, *lane);
+    }
+    args[0] = Slot::address(cell);
+    Ok(())
 }
 
 macro_rules! presentation_traps {
@@ -791,7 +797,6 @@ macro_rules! presentation_traps {
 presentation_traps! {
     obj_camera_start = "obj_camera_start";
     command_override = "command_override";
-    light_fadeout = "light_fadeout";
     screen_whitein = "func_screen_whitein";
 }
 
@@ -807,18 +812,12 @@ macro_rules! recorded_traps {
 }
 
 recorded_traps! {
-    obj_detach = "obj_detach";
     obj_hook_stop = "obj_hook_stop";
     motion_unhook = "obj_motion_unhook";
-    tex_fade_start = "obj_tex_fade_start";
-    search_by_unit_arg = "obj_search_by_unit_arg";
     dead_mark = "obj_dead_mark";
     set_pos_trans = "obj_set_pos_trans";
-    vacuum_destroy = "vacuum_destroy";
-    vacuum_set = "vacuum_set";
     camera_reset = "camera_reset";
     signal_call = "signal_call";
-    searcher_init = "target_searcher_init";
     progress_set_flag = "progress_set_flag";
     message_open = "message_open";
     message_close = "message_close";
@@ -850,16 +849,13 @@ unsupported_vector_traps! {
     camera_eye = (1, 305, "camera_eye");
     camera_at = (1, 306, "camera_at");
     path_dir = (5, 3, "get_path_dir");
-    lockon_target = (1, 191, "obj_lockon_target");
     target_attack = (1, 166, "target_attack");
 }
 
-/// 2:77 FUN_140433200: create a vacuum (a pull toward a point). [U] Recorded;
-/// the script gets a handle.
-fn vacuum_create(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("vacuum_create"));
-    let handle = ctx.world.next_magic_handle();
-    args[0] = Slot::address(handle);
+/// 1:191 FUN_14042b9c0: the record at +4 of the object's lock-on block
+/// (+0xdc8). Only Sora has one; the host says what it names.
+fn lockon_target(_: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    args[0] = Slot::address(crate::world::LOCKON_RECORD);
     Ok(())
 }
 
@@ -1068,22 +1064,53 @@ fn can_look(_: &mut Ctx<'_>, _: &mut Memory<'_>, args: &mut Args) -> Result<(), 
 }
 
 /// 1:156 FUN_14042ce60 -> FUN_1403cbec0: a hop (a short ballistic move in
-/// physics mode 2) with its motion. [U] The hop mode is not translated; the
-/// motion starts and the call is recorded.
+/// physics mode 9) with its motion. Arguments: the vector (heading, apex
+/// height, speed), the rise time, the steering inertia, the motion, its blend
+/// and whether the next two motions are the fall and land motions. The hop
+/// starts when the motion's take-off event fires.
 fn obj_hop(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
     let id = ctx.sys_of_ai(m, args[0].value)?;
-    let (slot, blend) = (args[4].as_int(), args[5].as_float());
+    let v = read_sanitized(ctx, m, args[1].value)?;
+    let (time, inertia) = (args[2].as_float(), args[3].as_float());
+    let (slot, blend, auto) = (args[4].as_int(), args[5].as_float(), args[6].as_int());
     let env = ctx.env;
     let obj = ctx.object(id)?;
+    obj.sys.arm_hop(v, time, inertia);
     obj.sys
         .motion_start(slot.max(0) as usize, blend, env.clips(obj.sys.model));
-    ctx.world.events.push(Event::Unsupported("obj_hop"));
+    if auto != 0 {
+        obj.sys.jump_motions = crate::sysobj::JumpMotions {
+            fall: slot + 1,
+            land: slot + 2,
+        };
+    }
     Ok(())
 }
 
-/// 1:73 FUN_14042d010 -> FUN_140422950: hover in physics mode 6. [U] Recorded.
-fn obj_hover(ctx: &mut Ctx<'_>, _: &mut Memory<'_>, _: &mut Args) -> Result<(), Fault> {
-    ctx.world.events.push(Event::Unsupported("obj_hover"));
+/// 6:42 FUN_14053e990: arm a hop like `obj_hop` (without a motion) and enter
+/// the hop mode at once (FUN_1403b4da0 mode 9).
+fn obj_hop_direct(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let id = ctx.sys_of_ai(m, args[0].value)?;
+    let v = read_sanitized(ctx, m, args[1].value)?;
+    let (time, inertia) = (args[2].as_float(), args[3].as_float());
+    let sys = &mut ctx.object(id)?.sys;
+    sys.arm_hop(v, time, inertia);
+    if let Some(crate::sysobj::PendingHop { hop }) = sys.pending_hop.take() {
+        sys.pending_mode = 0;
+        sys.enter_hop(hop);
+    }
+    Ok(())
+}
+
+/// 1:73 FUN_14042d010 -> FUN_140422950: hover in physics mode 6, the
+/// steering mode with the velocity `normalize(v.xyz) * v.w` and a steering
+/// inertia. The vector is the script's (+Y down), as the executable's mode
+/// keeps it.
+fn obj_hover(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<(), Fault> {
+    let id = ctx.sys_of_ai(m, args[0].value)?;
+    let v = read_native(ctx, m, args[1].value)?;
+    let inertia = args[2].as_float();
+    ctx.object(id)?.sys.start_hover(v, inertia);
     Ok(())
 }
 
@@ -1105,8 +1132,6 @@ fn vector_inter(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Resul
 recorded_traps! {
     look_start = "obj_look_start";
     look_end = "obj_look_end";
-    searcher_add = "target_searcher_add";
-    searcher_clear = "target_clear";
     mission_add_gauge = "mission_add_gauge";
     mission_increment_count = "mission_increment_count";
     mission_set_count_figure = "mission_set_count_figure_num";

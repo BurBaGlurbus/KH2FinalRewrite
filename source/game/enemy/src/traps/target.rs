@@ -40,9 +40,14 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
 enum Slot3 {
     Object(u32),
     Dup(usize),
+    /// Sora's lock-on record; the host decides what it names.
+    Lockon,
 }
 
 fn locate(handle: u32) -> Option<Slot3> {
+    if handle == crate::world::LOCKON_RECORD {
+        return Some(Slot3::Lockon);
+    }
     if let Some(d) = handle.checked_sub(TARGET_DUP_HANDLES)
         && d < 0x0100_0000
     {
@@ -62,12 +67,33 @@ fn record(ctx: &mut Ctx<'_>, handle: u32) -> Result<Target, Fault> {
             .copied()
             .flatten()
             .ok_or(Fault::Memory(handle)),
+        Slot3::Lockon => Ok(Target {
+            id: ctx.env.lockon_target().unwrap_or(0),
+            kind: -1,
+            group: 0,
+        }),
     }
+}
+
+/// The record target id naming an object: Sora, or the object.
+pub(super) fn target_id_of(id: crate::world::ObjId) -> u32 {
+    if id == crate::world::PLAYER_OBJECT {
+        PLAYER_TARGET
+    } else {
+        OBJECT_TARGET | id
+    }
+}
+
+/// The record at `handle`, for the other trap modules.
+pub(super) fn record_of(ctx: &mut Ctx<'_>, handle: u32) -> Result<Target, Fault> {
+    record(ctx, handle)
 }
 
 pub(super) fn set_record(ctx: &mut Ctx<'_>, handle: u32, t: Target) -> Result<(), Fault> {
     match locate(handle).ok_or(Fault::Memory(handle))? {
         Slot3::Object(id) => ctx.object(id)?.sys.target = t,
+        // The player's lock-on belongs to the player.
+        Slot3::Lockon => {}
         Slot3::Dup(i) => {
             *ctx.world
                 .target_dups
@@ -136,7 +162,7 @@ fn search(ctx: &mut Ctx<'_>, kind: i32, from: u32) -> Result<Target, Fault> {
         1 => ctx.object(from)?.sys.last_attacker.unwrap_or(PLAYER_TARGET),
         _ => PLAYER_TARGET,
     };
-    Ok(Target { id, kind })
+    Ok(Target { id, kind, group: 0 })
 }
 
 /// 1:121 FUN_1404303a0 -> FUN_1403be2b0: search for a target of `kind`.

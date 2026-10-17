@@ -23,6 +23,8 @@ pub fn lookup(table: u16, index: u16) -> Option<TrapFn> {
         5 => vector_sub,
         6 => vector_len,
         7 => vector_normalize,
+        82 => vector_outer_product,
+        91 => vector_inner_product,
         13 => vector_roty,
         16 => random_get,
         17 => random_getf,
@@ -165,6 +167,48 @@ fn vector_sub(ctx: &mut Ctx<'_>, m: &mut Memory<'_>, args: &mut Args) -> Result<
     let a = read_sanitized(ctx, m, args[0].value)?;
     let b = read_sanitized(ctx, m, args[1].value)?;
     return_vector(ctx, m, 5, [0, 1, 2, 3].map(|k| a[k] - b[k]), args)
+}
+
+/// 0:82 FUN_14041d570: the cross product a x b of two vectors (NaN lanes
+/// zeroed in place first); w is 0.
+fn vector_outer_product(
+    ctx: &mut Ctx<'_>,
+    m: &mut Memory<'_>,
+    args: &mut Args,
+) -> Result<(), Fault> {
+    let a = read_sanitized(ctx, m, args[0].value)?;
+    let b = read_sanitized(ctx, m, args[1].value)?;
+    // FUN_140142120.
+    let v = [
+        b[2] * a[1] - b[1] * a[2],
+        b[0] * a[2] - a[0] * b[2],
+        a[0] * b[1] - b[0] * a[1],
+        0.0,
+    ];
+    return_vector(ctx, m, 82, v, args)
+}
+
+/// 0:91 FUN_14041d8b0: the dot product of the two vectors after each is
+/// normalised (a copy; the operands stay), i.e. the cosine of the angle.
+fn vector_inner_product(
+    ctx: &mut Ctx<'_>,
+    m: &mut Memory<'_>,
+    args: &mut Args,
+) -> Result<(), Fault> {
+    let unit = |mut v: Vec4| {
+        let len = length3(&v);
+        if len != 0.0 {
+            let inv = 1.0 / len;
+            for lane in v.iter_mut().take(3) {
+                *lane *= inv;
+            }
+        }
+        v
+    };
+    let a = unit(read_sanitized(ctx, m, args[0].value)?);
+    let b = unit(read_sanitized(ctx, m, args[1].value)?);
+    args[0] = Slot::float(a[1] * b[1] + a[0] * b[0] + a[2] * b[2]);
+    Ok(())
 }
 
 /// FUN_140140f50: sqrtf(x*x + y*y + z*z), summed left to right in f32.

@@ -7,12 +7,16 @@ use data::{bar, path_lookup::Library, probe_source::ProbeSource};
 use enemy::{
     env::{Clips as EnemyClips, Env},
     sysobj::Sysobj,
-    world::{Object, World as EnemyWorld},
+    world::{Object, PLAYER_OBJECT, World as EnemyWorld},
 };
 use player::{World, actor_physics, combat, shadow::ScriptRandom};
 use std::sync::Arc;
 
 type Vec3 = [f32; 3];
+
+/// Sora's team number (`sysobj+0x4dc`): attacks with her team in their mask
+/// can hit her.
+const SORA_TEAM: u8 = 1;
 
 /// The host view the engine reads each tick.
 struct BrainEnv<'a> {
@@ -70,6 +74,8 @@ pub struct ScriptAttack {
     pub position: Vec3,
     pub previous: Option<Vec3>,
     pub radius: f32,
+    /// Sora's team (1) is in the attack's team mask.
+    pub hits_sora: bool,
 }
 
 /// An effect a script started: element `id` of the enemy's own container.
@@ -97,6 +103,9 @@ pub struct ScriptBrain {
     pub voices: Vec<(i32, i32)>,
     /// Names of the engine services the script called that are not translated.
     pub unsupported: std::collections::BTreeSet<&'static str>,
+    /// Attack slots the script applied to Sora directly (`attack_strike`),
+    /// for the host's hit resolution to take.
+    pub strikes: Vec<usize>,
 }
 
 fn script_payload(source: &ProbeSource, model: &str) -> Result<Vec<u8>, String> {
@@ -140,6 +149,7 @@ impl ScriptBrain {
             effects: Vec::new(),
             voices: Vec::new(),
             unsupported: Default::default(),
+            strikes: Vec::new(),
         };
         brain.build(position, yaw, stats, sstm, &mut ScriptRandom::default())?;
         Ok(brain)
@@ -181,7 +191,10 @@ impl ScriptBrain {
             player_yaw: self.player_yaw,
         };
         self.object.tick(&mut self.world, &env);
-        self.world.tick_attacks();
+        self.world.tick_attacks(&env);
+        self.world.deliver_shouts(&env, Some(&mut self.object));
+        self.world.follow_attachments(&env, Some(&mut self.object));
+        self.hit_the_map(room);
         self.drain_events();
         if self.object.sys.gone {
             self.world.attacks.clear();
@@ -211,15 +224,82 @@ impl ScriptBrain {
                     position: v(a.position),
                     previous: Some(v(a.previous)),
                     radius: a.current_radius(),
+                    hits_sora: a.can_hit_team(SORA_TEAM),
                 })
             })
             .collect()
     }
 
-    /// An attack of the script struck something.
+    /// An attack of the script struck Sora: it records the strike and the
+    /// script's hit callback runs (FUN_1403d1730).
     pub fn mark_attack_hit(&mut self, slot: usize) {
-        if let Some(Some(a)) = self.world.attacks.get_mut(slot) {
-            a.mark_hit(enemy::attack::flag::STRUCK);
+        let env = BrainEnv {
+            room: None,
+            clips: &self.clips,
+            player: self.player,
+            player_yaw: self.player_yaw,
+        };
+        self.object
+            .attack_struck(&mut self.world, &env, slot, PLAYER_OBJECT);
+        self.record_faults();
+    }
+
+    /// The attacks the script applied to Sora directly, with their parameter
+    /// ids (an attack freed since is dropped).
+    pub fn take_strikes(&mut self) -> Vec<(usize, i32, i32)> {
+        std::mem::take(&mut self.strikes)
+            .into_iter()
+            .filter_map(|slot| {
+                let a = self.world.attacks.get(slot)?.as_ref()?;
+                Some((slot, a.param_id, a.param_extra))
+            })
+            .collect()
+    }
+
+    /// Sora's guard turned an attack of the script back: it is marked
+    /// reflected and the script's reflect callback runs (FUN_1403d2140).
+    pub fn mark_attack_reflected(&mut self, slot: usize) {
+        let env = BrainEnv {
+            room: None,
+            clips: &self.clips,
+            player: self.player,
+            player_yaw: self.player_yaw,
+        };
+        self.object
+            .attack_reflected(&mut self.world, &env, slot, PLAYER_OBJECT);
+        self.record_faults();
+    }
+
+    /// The attacks that touch the map this frame get the wall or floor flag
+    /// and the point they touched, the way a script reads them
+    /// (`attack_is_hit_wall`, `attack_is_hit_floor`, `attack_get_hit_bg_pos`).
+    /// A sphere is tested against the room's floor under it and the walls
+    /// around it. [U] The executable's own map test for attack objects was
+    /// not located; this uses the room's collision directly.
+    fn hit_the_map(&mut self, room: &RoomWorld) {
+        use enemy::attack::flag;
+        for a in self.world.attacks.iter_mut().flatten() {
+            a.flags &= !(flag::HIT_WALL | flag::HIT_FLOOR);
+            if a.flags & flag::HAS_POSITION == 0 || a.flags & flag::LINE != 0 {
+                continue;
+            }
+            let r = a.current_radius();
+            let [x, y, z, _] = a.position;
+            if let Some(floor) = room.floor(x, z, y + r)
+                && y - r <= floor
+            {
+                a.flags |= flag::HIT_FLOOR;
+                a.hit_position = [x, floor, z, 1.];
+            }
+            let pushed = room.resolve_walls([x, z], r, y - r, y + r);
+            let (dx, dz) = (pushed[0] - x, pushed[1] - z);
+            let len = dx.hypot(dz);
+            if len > 1.0e-3 {
+                // The wall is a radius away from where the sphere was pushed
+                // to, back along the push.
+                a.flags |= flag::HIT_WALL;
+                a.hit_position = [pushed[0] - dx / len * r, y, pushed[1] - dz / len * r, 1.];
+            }
         }
     }
 
@@ -240,9 +320,14 @@ impl ScriptBrain {
                 Event::Unsupported(name) => {
                     self.unsupported.insert(name);
                 }
-                Event::Presentation { name, .. } => {
+                Event::Presentation { name, .. } | Event::Service { name, .. } => {
                     self.unsupported.insert(name);
                 }
+                Event::AttackStrike {
+                    slot,
+                    target: Some(PLAYER_OBJECT),
+                    ..
+                } => self.strikes.push(slot),
                 Event::MagicStart { .. } => {
                     self.unsupported.insert("magic_start_thread");
                 }
