@@ -332,6 +332,33 @@ mod tests {
     }
 
     #[test]
+    fn camera_chords_map_to_the_bits_the_lock_camera_reads() {
+        let logical_of = |pad: PadData| logical(raw(&pad), MODE_FIELD);
+        // Right stick up / down are logical bits 18 / 19 (FUN_140176bc0 zoom
+        // in / out), left / right 20 / 21 (turn), R3 is bit 17 (recenter) and
+        // R2 held is bit 32 (the zoom lock's override).
+        let stick = |x: u8, y: u8| PadData {
+            right: [x, y],
+            ..Default::default()
+        };
+        assert_eq!(logical_of(stick(128, 0)) & (0xf << 18), 1 << 18);
+        assert_eq!(logical_of(stick(128, 255)) & (0xf << 18), 1 << 19);
+        assert_eq!(logical_of(stick(0, 128)) & (0xf << 18), 1 << 20);
+        assert_eq!(logical_of(stick(255, 128)) & (0xf << 18), 1 << 21);
+        let r3 = PadData {
+            buttons: button::R3,
+            ..Default::default()
+        };
+        assert_ne!(logical_of(r3) & (1 << 17), 0);
+        let r2 = PadData {
+            buttons: button::R2,
+            ..Default::default()
+        };
+        assert_ne!(logical_of(r2) & (1 << 32), 0);
+        assert_eq!(logical_of(PadData::default()) & (1 << 32), 0);
+    }
+
+    #[test]
     fn repeat_after_30_then_every_4() {
         let mut pad = Pad::default();
         let mut fired = vec![];

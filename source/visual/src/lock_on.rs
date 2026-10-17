@@ -7,8 +7,13 @@
 //! The art is the `fiel` sequence's groups 1, 5, 23 and 27 (additive rings and
 //! four corner marks). Auto target: group 5 for the primary HP pool, 1 for
 //! others. Manual lock: 27 (blue) for the primary pool, 23 (red) for others.
+//! A side panel (group 20, a second Sprite3D at the same point and scale) is
+//! shown only for a flagged target (FUN_1403dd770 -> FUN_14017bf20).
 use crate::gauge::Draw;
 use data::sprite_sequence::{Modifiers, Player, Sequence};
+
+/// The side panel's group (FUN_14017bc60 creates it with id 0x14).
+const PANEL_GROUP: usize = 20;
 
 /// Groups by (manual, primary pool): FUN_1403dd770 / FUN_1403dd650.
 pub fn group_for(manual: bool, primary_pool: bool) -> usize {
@@ -82,41 +87,134 @@ impl LockOn {
 
 /// The lock manager's reticle: created when a target is acquired, replaced
 /// when the target or the lock state changes (the animation restarts), and
-/// destroyed with the target.
+/// destroyed with the target. A release (FUN_14017bfe0) does not delete the
+/// sprite: it restarts it on the group before its own (1 -> 0, 5 -> 4,
+/// 0x17 -> 0x16, 0x1b -> 0x1a, ten frames each in the `fiel` sheet) and the
+/// object deletes itself when that ends, still following its 3D point.
 #[derive(Default)]
 pub struct Reticle {
-    shown: Option<(u64, LockOn)>,
+    shown: Option<Shown>,
+    outros: Vec<Outro>,
+}
+
+struct Shown {
+    key: u64,
+    lock: LockOn,
+    /// The side panel, created hidden and frozen: it plays only while shown.
+    panel: LockOn,
+    /// The target point in game space, for the outro.
+    world: [f32; 3],
+}
+
+struct Outro {
+    lock: LockOn,
+    world: [f32; 3],
 }
 
 /// What the lock manager is holding this frame.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Held {
     /// Identity of the held target and shape; a change replaces the reticle.
     pub key: u64,
     pub manual: bool,
     pub primary_pool: bool,
+    /// The target actor's flag +0x6c8 bit 1 with its counters +0xd1c or
+    /// +0xd20 above zero (placement byte +0x31 of its spawn record): the
+    /// side panel is shown. The test room's actors carry no such counters.
+    pub flagged: bool,
+    /// The manager's hide flag (+0x40 bit 0): no reticle is kept.
+    pub hidden: bool,
 }
 
 impl Reticle {
-    /// One frame: `screen` is the target shape centre projected through the
-    /// camera. Returns the reticle's drawable when it exists.
+    /// One frame: `held` carries the target shape centre in game space and
+    /// `project` maps a game-space point through the camera as last applied
+    /// to layout units and depth. Returns the drawable when anything shows.
     pub fn step(
         &mut self,
         seq: &Sequence,
         held: Option<(Held, [f32; 3])>,
+        project: &dyn Fn([f32; 3]) -> [f32; 3],
         sheet: usize,
     ) -> Option<Draw> {
-        let Some((held, screen)) = held else {
-            self.shown = None;
-            return None;
+        let held = held.filter(|(held, _)| !held.hidden);
+        let wanted = held.map(|(held, _)| {
+            let group = group_for(held.manual, held.primary_pool);
+            (held.key << 8 | group as u64, group)
+        });
+        // Same group, another target: FUN_14017bb80 re-creates the sprite at
+        // once. Anything else retires the old one through its outro.
+        let replaced = match (&self.shown, wanted) {
+            (Some(shown), Some((key, _))) => shown.key != key,
+            (Some(_), None) => true,
+            _ => false,
         };
-        let group = group_for(held.manual, held.primary_pool);
-        let key = held.key << 8 | group as u64;
-        if self.shown.as_ref().is_none_or(|(shown, _)| *shown != key) {
-            self.shown = Some((key, LockOn::new(seq, group)));
+        if replaced && let Some(old) = self.shown.take() {
+            let group = (old.key & 0xff) as usize;
+            if wanted.is_none_or(|(_, new_group)| new_group != group) {
+                let mut lock = LockOn::new(seq, group - 1);
+                lock.screen = old.lock.screen;
+                lock.scale = old.lock.scale;
+                self.outros.push(Outro {
+                    lock,
+                    world: old.world,
+                });
+            }
         }
-        let (_, lock) = self.shown.as_mut()?;
-        lock.update(seq, screen);
-        lock.draw(seq, sheet)
+        let mut quads = Vec::new();
+        let mut z = 0;
+        let mut collect = |draw: Option<Draw>, sheet_out: &mut usize| {
+            if let Some(Draw::Quads {
+                quads: more,
+                z: draw_z,
+                sheet,
+            }) = draw
+            {
+                z = draw_z;
+                *sheet_out = sheet;
+                quads.extend(more);
+            }
+        };
+        let mut sheet_out = sheet;
+        if let (Some((held, world)), Some((key, group))) = (held, wanted) {
+            if self.shown.is_none() {
+                self.shown = Some(Shown {
+                    key,
+                    lock: LockOn::new(seq, group),
+                    panel: LockOn::new(seq, PANEL_GROUP),
+                    world,
+                });
+            }
+            if let Some(shown) = self.shown.as_mut() {
+                shown.world = world;
+                shown.lock.update(seq, project(world));
+                // FUN_14017bf20: a flagged target shows and unfreezes the
+                // panel, an unflagged one hides and freezes it.
+                shown.panel.screen = shown.lock.screen;
+                shown.panel.scale = shown.lock.scale;
+                if held.flagged {
+                    shown.panel.player.update(seq, 1.);
+                }
+                collect(shown.lock.draw(seq, sheet), &mut sheet_out);
+                if held.flagged {
+                    collect(shown.panel.draw(seq, sheet), &mut sheet_out);
+                }
+            }
+        }
+        // FUN_14016b3c0 deletes an outro sprite once its animation ends.
+        self.outros.retain_mut(|outro| {
+            outro.lock.update(seq, project(outro.world));
+            if outro.lock.player.finished() {
+                return false;
+            }
+            collect(outro.lock.draw(seq, sheet), &mut sheet_out);
+            true
+        });
+        (!quads.is_empty()).then_some(Draw::Quads {
+            quads,
+            z,
+            sheet: sheet_out,
+        })
     }
 }
 
@@ -211,19 +309,117 @@ mod tests {
                     key,
                     manual: true,
                     primary_pool: true,
+                    ..Held::default()
                 },
                 [256., 208., 600.],
             ))
         };
-        assert!(reticle.step(&seq, held(1), 3).is_some());
+        assert!(reticle.step(&seq, held(1), &|p| p, 3).is_some());
         for _ in 0..30 {
-            reticle.step(&seq, held(1), 3);
+            reticle.step(&seq, held(1), &|p| p, 3);
         }
-        let time = reticle.shown.as_ref().unwrap().1.player.time;
+        let time = reticle.shown.as_ref().unwrap().lock.player.time;
         assert!(time > 12.);
-        reticle.step(&seq, held(2), 3);
-        assert!(reticle.shown.as_ref().unwrap().1.player.time < 2.);
-        assert!(reticle.step(&seq, None, 3).is_none());
+        reticle.step(&seq, held(2), &|p| p, 3);
+        assert!(reticle.shown.as_ref().unwrap().lock.player.time < 2.);
+        // A release retires the sprite through its outro (the synthetic outro
+        // group loops, so it stays).
+        reticle.step(&seq, None, &|p| p, 3);
         assert!(reticle.shown.is_none());
+        assert_eq!(reticle.outros.len(), 1);
+    }
+
+    #[test]
+    fn a_flagged_target_adds_the_side_panel_and_the_hide_flag_removes_the_reticle() {
+        let seq = synthetic();
+        let mut reticle = Reticle::default();
+        let held = |flagged, hidden| {
+            Some((
+                Held {
+                    key: 7,
+                    manual: false,
+                    primary_pool: true,
+                    flagged,
+                    hidden,
+                },
+                [256., 208., 600.],
+            ))
+        };
+        let quads = |draw: Option<Draw>| match draw {
+            Some(Draw::Quads { quads, .. }) => quads.len(),
+            _ => 0,
+        };
+        let plain = quads(reticle.step(&seq, held(false, false), &|p| p, 3));
+        assert_eq!(plain, 1);
+        // The panel is frozen while hidden: it has not even started.
+        assert_eq!(reticle.shown.as_ref().unwrap().panel.player.state, 1);
+        // Shown, it starts on its first frame and then advances.
+        assert_eq!(quads(reticle.step(&seq, held(true, false), &|p| p, 3)), 2);
+        assert_eq!(quads(reticle.step(&seq, held(true, false), &|p| p, 3)), 2);
+        assert!(reticle.shown.as_ref().unwrap().panel.player.time > 0.);
+        let paused = reticle.shown.as_ref().unwrap().panel.player.time;
+        assert_eq!(quads(reticle.step(&seq, held(false, false), &|p| p, 3)), 1);
+        assert_eq!(reticle.shown.as_ref().unwrap().panel.player.time, paused);
+        // The hide flag destroys the reticle, so the animation restarts after.
+        reticle.step(&seq, held(false, true), &|p| p, 3);
+        assert!(reticle.shown.is_none());
+        // The restarted reticle and its panel draw next to the old outro.
+        assert_eq!(quads(reticle.step(&seq, held(true, false), &|p| p, 3)), 3);
+    }
+
+    #[test]
+    fn a_release_plays_the_group_before_and_a_same_class_retarget_does_not() {
+        let mut seq = synthetic();
+        // Group 26 (manual primary's outro) runs ten frames once.
+        let mut short = seq.animations[0];
+        short.frames = [0, 9];
+        seq.animations.push(short);
+        seq.groups[26] = AnimationGroup {
+            animations: 1..2,
+            play_count: 1,
+            loop_frames: [0, 0],
+            ..seq.groups[26].clone()
+        };
+        let mut reticle = Reticle::default();
+        let held = |key| {
+            Some((
+                Held {
+                    key,
+                    manual: true,
+                    primary_pool: true,
+                    ..Held::default()
+                },
+                [256., 208., 600.],
+            ))
+        };
+        let quads = |draw: Option<Draw>| match draw {
+            Some(Draw::Quads { quads, .. }) => quads.len(),
+            _ => 0,
+        };
+        reticle.step(&seq, held(1), &|p| p, 3);
+        // Another target in the same class replaces the sprite at once.
+        reticle.step(&seq, held(2), &|p| p, 3);
+        assert!(reticle.outros.is_empty());
+        // Releasing keeps drawing the outro for its ten frames, then removes it.
+        let mut shown = 0;
+        while quads(reticle.step(&seq, None, &|p| p, 3)) > 0 {
+            shown += 1;
+            assert!(shown < 30);
+        }
+        assert_eq!(shown, 10);
+        assert!(reticle.outros.is_empty());
+        // A change of class (auto -> manual) overlaps the outro with the new
+        // sprite.
+        let auto = Some((
+            Held {
+                key: 3,
+                manual: false,
+                primary_pool: true,
+                ..Held::default()
+            },
+            [256., 208., 600.],
+        ));
+        reticle.step(&seq, auto, &|p| p, 3);
+        assert_eq!(quads(reticle.step(&seq, held(3), &|p| p, 3)), 2);
     }
 }

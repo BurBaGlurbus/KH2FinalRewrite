@@ -48,6 +48,8 @@ pub struct WorldShape {
 
 pub struct ShapePose {
     pub camera: Vec<WorldShape>,
+    /// Live kind-18 camera-collision spheres (see `camera_spheres`).
+    pub spheres: Vec<WorldShape>,
     pub body: Vec<WorldShape>,
     pub targets: Vec<WorldShape>,
     pub attacks: HashMap<u8, Vec<WorldShape>>,
@@ -70,6 +72,9 @@ impl AttackWindow {
 
 pub struct EnemyCombat {
     pub camera: Vec<HitShape>,
+    /// Kind-18 shapes the camera ray is cut at (FUN_1403c9c00 via
+    /// FUN_140167c20).
+    pub spheres: Vec<HitShape>,
     pub object_id: u32,
     pub character: u16,
     pub enmp_id: u16,
@@ -196,6 +201,7 @@ impl EnemyCombat {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let spheres = camera_spheres(&collision);
         let battle = library.read("00battle.bin").map_err(|e| e.to_string())?;
         let enemy = battle_tables::enemy(payload(&battle, b"enmp")?, binding.enmp_id)
             .map_err(|e| e.to_string())?;
@@ -277,6 +283,7 @@ impl EnemyCombat {
         source.verify_session().map_err(|e| e.to_string())?;
         Ok(Self {
             camera,
+            spheres,
             object_id: object.object_id,
             character: object.character,
             enmp_id: binding.enmp_id,
@@ -423,6 +430,7 @@ impl EnemyCombat {
         };
         Ok(ShapePose {
             camera: transform(&self.camera)?,
+            spheres: transform(&self.spheres)?,
             body: transform(&self.body)?,
             targets: transform(&self.targets)?,
             attacks: self
@@ -432,6 +440,31 @@ impl EnemyCombat {
                 .collect::<Result<_>>()?,
         })
     }
+}
+
+/// The kind-18 entries that are live without script help: FUN_1403c9c00
+/// zeroes a sphere unless its bone field carries bit 14 (or the actor's flag
+/// +0x9b8 bit 10 is set, which no supported actor sets), and only the plain
+/// actor-origin attachment (0x4000) is modelled; the other 0x4001..0x4009
+/// attachments need the executable's bone-pair anchors (FUN_1403b5450).
+fn camera_spheres(entries: &[object_collision::Entry]) -> Vec<HitShape> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == 18 && e.bone == 0x4000 && e.radius > 0)
+        .map(|(ordinal, e)| HitShape {
+            ordinal,
+            group: e.group,
+            bone: 0x4000,
+            offset: Vec3::from_array(e.position.map(f32::from)),
+            position_height: e.position_height as f32,
+            radius: e.radius as f32,
+            height: e.height as f32,
+            shape: e.shape,
+            parts: e.parts,
+            high: false,
+        })
+        .collect()
 }
 
 type CollisionShapes = (Vec<HitShape>, Vec<HitShape>, HashMap<u8, Vec<HitShape>>);
@@ -554,8 +587,17 @@ mod tests {
             1,
         )
         .unwrap();
+        // Only kind-18 entries attached to the actor origin (0x4000) are live;
+        // a plain bone stays inert without the actor flag.
+        let mut root_sphere = entry(18, 3);
+        root_sphere.bone = 0x4000;
+        root_sphere.position = [0, 0, 200];
+        root_sphere.position_height = 7;
+        let spheres = camera_spheres(&[root_sphere, entry(18, 3), entry(object_collision::HIT, 3)]);
+        assert_eq!(spheres.len(), 1);
         let data = EnemyCombat {
             camera: Vec::new(),
+            spheres,
             object_id: 1,
             character: 1,
             enmp_id: 1,
@@ -583,6 +625,19 @@ mod tests {
             .unwrap();
         assert_eq!(pose.body[0].centre, Vec3::new(106., 212., 318.));
         assert_eq!(pose.targets[0].centre, pose.body[0].centre);
+        // The origin attachment ignores the bone matrices and the removed
+        // root, and follows the actor's position and yaw.
+        assert_eq!(pose.spheres[0].centre, Vec3::new(100., 207., 500.));
+        assert_eq!(pose.spheres[0].radius, 20.);
+        let turned = data
+            .transform_shapes(
+                &matrices,
+                Vec3::ZERO,
+                Vec3::new(100., 200., 300.),
+                std::f32::consts::FRAC_PI_2,
+            )
+            .unwrap();
+        assert!((turned.spheres[0].centre - Vec3::new(300., 207., 300.)).length() < 1e-3);
         assert!(
             data.transform_shapes(&[], Vec3::ZERO, Vec3::ZERO, 0.)
                 .is_err()

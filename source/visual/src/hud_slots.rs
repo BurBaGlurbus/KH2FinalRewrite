@@ -3,6 +3,15 @@
 //! when they are destroyed (FUN_140182b80); an object's stacking position is
 //! the sum of the cells of every lower slot in its sub-slot (FUN_140182ba0).
 //! The Scan gauge is slot 18, sub-slot 1.
+//!
+//! Who registers in the executable (FUN_140182b10 callers): the radar takes
+//! slot 18 / sub-slot 1 with height 0, so it never moves the gauge; the
+//! information window (slot 1), the NEXT_EXP window (slot 14) and the
+//! GET_MUNNY window (slot 17) all use sub-slot 0, which the gauge does not
+//! stack on; only the script-driven counter, mission gauge and information
+//! pop-ups (FUN_14018be20, FUN_14018c990, FUN_14018d1b0) take their slot and
+//! sub-slot from event-script arguments, and the rewrite plays none of those
+//! scripts. The offset therefore stays zero in every supported scene.
 
 /// Slots 0 through 18 fit the executable's 59-short table.
 pub const SLOTS: usize = 19;

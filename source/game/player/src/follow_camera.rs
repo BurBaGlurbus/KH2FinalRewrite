@@ -159,14 +159,97 @@ pub fn triangle_hit(triangles: &[[Vec3; 3]], from: Vec3, to: Vec3) -> Option<Ray
     })
 }
 
-/// FUN_140164940 with the default push-off: the segment `from` -> `to` is cast
+/// A dynamic camera-collision sphere: one live kind-18 shape of an actor in
+/// game world space (the 0x28-byte record FUN_1403c9c00 builds: the shape's
+/// position through the actor or bone matrix, its stored height subtracted
+/// from Y, and its radius).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sphere {
+    pub centre: Vec3,
+    pub radius: f32,
+}
+
+/// The executable's sphere list holds at most 0x40 entries (FUN_140167c20).
+pub const MAX_SPHERES: usize = 0x40;
+
+fn length(a: Vec3) -> f32 {
+    dot(a, a).sqrt()
+}
+
+/// FUN_140179200: where the segment `start` -> `end` enters the sphere. The
+/// line's closest approach to the centre must be within the radius; when that
+/// closest point lies beyond an end of the segment, that end must be inside
+/// the sphere. The entry point is the closest point minus the half-chord
+/// along the segment.
+fn sphere_entry(sphere: Sphere, start: Vec3, end: Vec3) -> Option<Vec3> {
+    let mid = [0, 1, 2].map(|i| (start[i] + end[i]) * 0.5);
+    let half = sub(end, mid);
+    let centre = sub(sphere.centre, mid);
+    let length_squared = dot(half, half);
+    if length_squared < f32::MIN_POSITIVE {
+        return None;
+    }
+    let along = dot(half, centre);
+    let radius_squared = sphere.radius * sphere.radius;
+    let miss_squared = dot(centre, centre) - (along * along) / length_squared;
+    if radius_squared < miss_squared {
+        return None;
+    }
+    let scaled = half.map(|c| c * along * (1. / length_squared));
+    let closest = [0, 1, 2].map(|i| mid[i] + scaled[i]);
+    if !(-length_squared <= along && along <= length_squared) {
+        let nearer = if along > length_squared { end } else { start };
+        let off = sub(sphere.centre, nearer);
+        if radius_squared < dot(off, off) {
+            return None;
+        }
+    }
+    let chord = ((radius_squared - miss_squared) / length_squared)
+        .abs()
+        .sqrt();
+    Some([0, 1, 2].map(|i| closest[i] - half[i] * chord))
+}
+
+/// FUN_140167a50: the segment's entry point into the sphere list. A sphere
+/// that contains `start` is skipped, and the executable's loop does not step
+/// to the next entry after a skip, so every later iteration meets the same
+/// skipped sphere. Each accepted entry point becomes the end of the segment
+/// the later spheres are tested against, while the reach it is compared with
+/// stays the original length.
+pub fn sphere_hit(spheres: &[Sphere], start: Vec3, end: Vec3) -> Option<Vec3> {
+    let reach = length(sub(end, start));
+    let mut end = end;
+    let mut hit = None;
+    for sphere in spheres.iter().take(MAX_SPHERES) {
+        if length(sub(sphere.centre, start)) <= sphere.radius {
+            break;
+        }
+        if let Some(point) = sphere_entry(*sphere, start, end)
+            && length(sub(point, start)) < reach
+        {
+            hit = Some(point);
+            // The scan works on a copy of the segment whose end becomes the
+            // entry point, so later spheres only count inside it.
+            end = point;
+        }
+    }
+    hit
+}
+
+/// FUN_140164940 with the default push-off: the segment `from` -> `to` is
+/// first cut at the dynamic spheres (empty when no actor has any), then cast
 /// against the camera collision; on a hit the end moves to the hit point plus
 /// the polygon normal times 5. A surface-5 polygon re-casts from `from` to the
 /// end's horizontal position at the hit's height (the end offset by the
-/// previous target `prev`), and the re-cast point replaces the hit. Returns
-/// the clipped end.
-pub fn clip(prev: Vec3, from: Vec3, to: Vec3, cast: Cast) -> Option<Vec3> {
-    let hit = cast(from, to)?;
+/// previous target `prev`), and the re-cast point replaces the hit. A sphere
+/// cut with no polygon behind it ends exactly on the sphere. Returns the
+/// clipped end.
+pub fn clip_with(prev: Vec3, from: Vec3, to: Vec3, cast: Cast, spheres: &[Sphere]) -> Option<Vec3> {
+    let cut = sphere_hit(spheres, from, to);
+    let to = cut.unwrap_or(to);
+    let Some(hit) = cast(from, to) else {
+        return cut;
+    };
     let mut end = hit.point;
     if hit.surface == 5 {
         let delta = sub(to, prev);
@@ -174,6 +257,11 @@ pub fn clip(prev: Vec3, from: Vec3, to: Vec3, cast: Cast) -> Option<Vec3> {
         end = cast(from, probe).map_or(probe, |second| second.point);
     }
     Some([0, 1, 2].map(|k| end[k] + hit.normal[k] * COLLISION_OFFSET))
+}
+
+/// `clip_with` against the camera collision alone.
+pub fn clip(prev: Vec3, from: Vec3, to: Vec3, cast: Cast) -> Option<Vec3> {
+    clip_with(prev, from, to, cast, &[])
 }
 
 /// Per-frame inputs. Stick axes follow the pad convention: x right, y
@@ -194,10 +282,27 @@ pub struct CameraInput {
     pub turn: f32,
     /// Manual zoom (-1..1, positive moves away).
     pub zoom: f32,
+    /// The right stick's analog magnitude (pad +0x2c); any deflection stops
+    /// the automatic swing behind the player.
+    pub right_stick: f32,
     /// Swing directly behind the player and restore the mode radius.
     pub recenter: bool,
+    /// The follow target's zoom lock (FUN_1403babf0: bit 3 of the object the
+    /// follow reference's +0xc handle names). While set, manual zoom is
+    /// ignored unless `zoom_override` is. No supported actor sets it.
+    pub zoom_locked: bool,
+    /// Pad bit 32 (R2) held: zoom stays allowed through the lock.
+    pub zoom_override: bool,
     /// The player's speed parameter (PRTY run speed in this test room).
     pub speed: f32,
+}
+
+impl CameraInput {
+    /// The test every zoom routine makes (FUN_140165110, FUN_140176c70, ...):
+    /// zoom unless the lock is set and the override is not held.
+    fn zoom_allowed(&self) -> bool {
+        !self.zoom_locked || self.zoom_override
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -424,6 +529,11 @@ impl FollowCamera {
     /// One frame. `cast` returns the first camera-collision hit on a segment
     /// (see `triangle_hit`).
     pub fn tick(&mut self, input: &CameraInput, cast: Cast) {
+        self.tick_with(input, cast, &[]);
+    }
+
+    /// `tick` with the dynamic camera-collision spheres of this frame.
+    pub fn tick_with(&mut self, input: &CameraInput, cast: Cast, spheres: &[Sphere]) {
         self.look_at_target_prev = self.look_at_target;
         self.eye_target_prev = self.eye_target;
         let speed_offset = input.speed - SPEED_REFERENCE;
@@ -431,7 +541,7 @@ impl FollowCamera {
         // afterwards.
         let gain = (SPRING_GAIN + speed_offset * SPRING_GAIN_PER_UNIT) * 0.5;
         if let Some(anchor) = input.lock_target {
-            self.tick_lock(input, anchor, cast);
+            self.tick_lock(input, anchor, cast, spheres);
             let feet_up = [
                 input.player_position[0],
                 input.player_position[1] - LOOK_AT_HEIGHT,
@@ -440,31 +550,39 @@ impl FollowCamera {
             self.spring_to_targets(gain);
             // FUN_140176e40: mode 2 clips only the eye, from the player's
             // upper body, and does not feed the clip back to the target.
-            if let Some(eye) = clip(self.eye_target_prev, feet_up, self.eye, cast) {
+            if let Some(eye) = clip_with(self.eye_target_prev, feet_up, self.eye, cast, spheres) {
                 self.eye = eye;
             }
             return;
         }
         let mode = self.mode;
         let mut snap = false;
-        if input.turn != 0. {
-            self.yaw = wrap(self.yaw + input.turn * MANUAL_TURN);
-            self.yaw_target = self.yaw;
-        } else if input.recenter {
+        // FUN_140165110 tests the recenter press (pad bit 17) first; the
+        // manual turn is its else branch.
+        if input.recenter {
             self.radius = mode.radius;
             self.yaw_target = behind(input.player_forward);
             self.eye = self.eye_target;
             snap = input.magnitude != 0.;
+        } else if input.turn != 0. {
+            self.yaw = wrap(self.yaw + input.turn * MANUAL_TURN);
+            self.yaw_target = self.yaw;
         }
-        if input.zoom > 0. {
-            self.radius = (self.radius + input.zoom * MANUAL_ZOOM).min(mode.radius_max);
-        } else if input.zoom < 0. {
-            self.radius = (self.radius + input.zoom * MANUAL_ZOOM).max(mode.radius_min);
+        let zoom = if input.zoom_allowed() { input.zoom } else { 0. };
+        if zoom > 0. {
+            self.radius = (self.radius + zoom * MANUAL_ZOOM).min(mode.radius_max);
+        } else if zoom < 0. {
+            self.radius = (self.radius + zoom * MANUAL_ZOOM).max(mode.radius_min);
         }
         if !snap
             && input.moved
             && input.magnitude != 0.
+            // The follow branch also needs the right stick idle (pad +0x2c,
+            // the magnitude behind both turn and zoom), whether or not the
+            // zoom lock discards the zoom.
+            && input.right_stick == 0.
             && input.turn == 0.
+            && input.zoom == 0.
             && input.stick[1] < FOLLOW_STICK_LIMIT
         {
             let step = 2.
@@ -483,16 +601,17 @@ impl FollowCamera {
             }
         }
         self.place_targets(input.player_position, snap);
-        if let Some(end) = clip(
+        if let Some(end) = clip_with(
             self.eye_target_prev,
             self.look_at_target,
             self.eye_target,
             cast,
+            spheres,
         ) {
             self.eye_target = end;
         }
         self.spring_to_targets(gain);
-        if let Some(eye) = clip(self.eye_target_prev, self.look_at, self.eye, cast) {
+        if let Some(eye) = clip_with(self.eye_target_prev, self.look_at, self.eye, cast, spheres) {
             self.eye = eye;
             self.eye_target = eye;
         }
@@ -512,7 +631,7 @@ impl FollowCamera {
     /// Mode 2 (FUN_140176c70): the look point blends toward the locked
     /// target's camera anchor, the radius and yaw react to the target and the
     /// player leaving the screen, and the eye target stays on the player.
-    fn tick_lock(&mut self, input: &CameraInput, anchor: Vec3, cast: Cast) {
+    fn tick_lock(&mut self, input: &CameraInput, anchor: Vec3, cast: Cast, spheres: &[Sphere]) {
         let player = input.player_position;
         let feet_up = [player[0], player[1] - LOOK_AT_HEIGHT, player[2]];
         // FUN_140176ec0 with k = 0.3.
@@ -567,14 +686,16 @@ impl FollowCamera {
             self.yaw = wrap(self.yaw + MANUAL_TURN * input.turn);
             self.yaw_target = self.yaw;
         }
-        // FUN_140176bc0: zoom with the right stick, one step per frame.
-        if input.zoom < 0. {
-            self.radius += input.zoom * MANUAL_ZOOM;
+        // FUN_140176bc0: zoom with the right stick, one step per frame,
+        // unless the follow target's zoom lock holds it.
+        let zoom = if input.zoom_allowed() { input.zoom } else { 0. };
+        if zoom < 0. {
+            self.radius += zoom * MANUAL_ZOOM;
             if self.radius <= self.mode.radius_min {
                 self.radius = self.mode.radius_min;
             }
-        } else if input.zoom > 0. {
-            self.radius += input.zoom * MANUAL_ZOOM;
+        } else if zoom > 0. {
+            self.radius += zoom * MANUAL_ZOOM;
             if self.mode.radius_max <= self.radius {
                 self.radius = self.mode.radius_max;
             }
@@ -588,7 +709,13 @@ impl FollowCamera {
         let look_target = self.look_at_target;
         self.yaw = approach(self.yaw, self.yaw_target, YAW_EASE);
         self.place_eye_target(feet_up);
-        if let Some(end) = clip(self.eye_target_prev, feet_up, self.eye_target, cast) {
+        if let Some(end) = clip_with(
+            self.eye_target_prev,
+            feet_up,
+            self.eye_target,
+            cast,
+            spheres,
+        ) {
             self.eye_target = end;
         }
         self.look_at_target = look_target;
@@ -808,6 +935,168 @@ mod tests {
             clip([0.; 3], [0.; 3], [0., 0., -300.], &plain),
             Some([0., -10., -45.])
         );
+    }
+
+    fn ball(z: f32, radius: f32) -> Sphere {
+        Sphere {
+            centre: [0., 0., z],
+            radius,
+        }
+    }
+
+    #[test]
+    fn a_segment_enters_a_sphere_at_its_near_surface() {
+        let hit = sphere_hit(&[ball(-100., 20.)], [0.; 3], [0., 0., -300.]).unwrap();
+        assert!((hit[2] + 80.).abs() < 1e-3 && hit[0].abs() < 1e-3);
+        // Off the line by more than the radius, and beyond the end.
+        let aside = Sphere {
+            centre: [50., 0., -100.],
+            radius: 20.,
+        };
+        assert_eq!(sphere_hit(&[aside], [0.; 3], [0., 0., -300.]), None);
+        assert_eq!(
+            sphere_hit(&[ball(-400., 20.)], [0.; 3], [0., 0., -300.]),
+            None
+        );
+        // The segment ends inside the sphere: the closest point is past the
+        // end, the end is within the radius, and the entry is still found.
+        let ending = sphere_hit(&[ball(-310., 20.)], [0.; 3], [0., 0., -300.]).unwrap();
+        assert!((ending[2] + 290.).abs() < 1e-3);
+        // A zero-length segment never hits.
+        assert_eq!(sphere_hit(&[ball(0., 20.)], [0.; 3], [0.; 3]), None);
+    }
+
+    #[test]
+    fn a_sphere_holding_the_start_stops_the_scan_and_the_nearest_entry_wins() {
+        let start = [0.; 3];
+        let end = [0., 0., -300.];
+        // The first sphere contains the start: the executable never steps past
+        // it, so the second sphere is not tested.
+        assert_eq!(
+            sphere_hit(&[ball(-10., 20.), ball(-100., 20.)], start, end),
+            None
+        );
+        // Each accepted entry shortens the segment the later spheres are
+        // tested against, so the nearer entry wins in either list order.
+        for order in [
+            [ball(-100., 20.), ball(-200., 20.)],
+            [ball(-200., 20.), ball(-100., 20.)],
+        ] {
+            let hit = sphere_hit(&order, start, end).unwrap();
+            assert!((hit[2] + 80.).abs() < 1e-3);
+        }
+        // At most 0x40 spheres are read.
+        let mut many = vec![ball(-5000., 1.); MAX_SPHERES];
+        many.push(ball(-100., 20.));
+        assert_eq!(sphere_hit(&many, start, end), None);
+    }
+
+    #[test]
+    fn a_sphere_cut_ends_the_clip_with_or_without_a_polygon_behind() {
+        let start = [0.; 3];
+        let end = [0., 0., -300.];
+        let sphere = [ball(-100., 20.)];
+        // No polygon: the end sits exactly on the sphere.
+        let none = |_: Vec3, _: Vec3| None;
+        let cut = clip_with([0.; 3], start, end, &none, &sphere).unwrap();
+        assert!((cut[2] + 80.).abs() < 1e-3);
+        // A polygon behind the sphere is out of reach of the shortened segment.
+        let behind = |from: Vec3, to: Vec3| {
+            (to[2] <= -250.).then_some(RayHit {
+                point: [from[0], from[1], -250.],
+                normal: [0., 0., 1.],
+                surface: 0,
+            })
+        };
+        let cut = clip_with([0.; 3], start, end, &behind, &sphere).unwrap();
+        assert!((cut[2] + 80.).abs() < 1e-3);
+        // A polygon in front of the sphere wins and is pushed off by 5.
+        let front = |_: Vec3, _: Vec3| {
+            Some(RayHit {
+                point: [0., 0., -40.],
+                normal: [0., 0., 1.],
+                surface: 0,
+            })
+        };
+        let cut = clip_with([0.; 3], start, end, &front, &sphere).unwrap();
+        assert_eq!(cut, [0., 0., -35.]);
+        // Without spheres the plain clip is unchanged.
+        assert_eq!(clip([0.; 3], start, end, &none), None);
+    }
+
+    #[test]
+    fn the_eye_stops_at_a_dynamic_sphere_behind_the_player() {
+        let mut camera = FollowCamera::new(OUTDOOR, &input([0., 0., 0.], [0., 0., 1.]));
+        // The follow camera sits behind +Z facing, so a sphere on the way
+        // from the look point to the eye target cuts the eye target short.
+        let eye_target = camera.eye_target;
+        let look = camera.look_at_target;
+        let toward = sub(eye_target, look);
+        let centre = [0, 1, 2].map(|i| look[i] + toward[i] * 0.5);
+        let sphere = [Sphere {
+            centre,
+            radius: 20.,
+        }];
+        camera.tick_with(&input([0., 0., 0.], [0., 0., 1.]), &|_, _| None, &sphere);
+        let reach = length(sub(camera.eye_target, look));
+        assert!(reach < length(toward) * 0.6, "eye target cut at the sphere");
+    }
+
+    #[test]
+    fn zoom_obeys_the_follow_targets_lock_unless_the_override_is_held() {
+        // The radius after one frame; the lock camera also drifts toward its
+        // own radius, so a gated zoom must equal no zoom at all.
+        let radius = |zoom: f32, locked: bool, held: bool, lock: bool| {
+            let mut step = input([0.; 3], [0., 0., 1.]);
+            step.zoom = zoom;
+            step.zoom_locked = locked;
+            step.zoom_override = held;
+            if lock {
+                step.lock_target = Some([100., -50., 200.]);
+            }
+            let mut camera = FollowCamera::new(OUTDOOR, &step);
+            camera.tick(&step, &|_, _| None);
+            camera.radius
+        };
+        for lock in [false, true] {
+            let rest = radius(0., false, false, lock);
+            assert_eq!(radius(-1., true, false, lock), rest);
+            assert!(radius(-1., true, true, lock) < rest);
+            assert!(radius(-1., false, false, lock) < rest);
+        }
+    }
+
+    #[test]
+    fn follow_needs_the_right_stick_idle_and_recenter_beats_a_manual_turn() {
+        let mut moving = input([0., 0., 0.], [1., 0., 0.]);
+        moving.moved = true;
+        moving.magnitude = 1.;
+        let yaw_after = |step: &CameraInput| {
+            let mut camera = FollowCamera::new(OUTDOOR, &input([0., 0., 0.], [0., 0., 1.]));
+            camera.tick(step, &|_, _| None);
+            camera.yaw
+        };
+        let start = FollowCamera::new(OUTDOOR, &input([0., 0., 0.], [0., 0., 1.])).yaw;
+        let idle = yaw_after(&moving);
+        let mut deflected = moving;
+        deflected.right_stick = 0.5;
+        assert_ne!(
+            idle,
+            FollowCamera::new(OUTDOOR, &input([0., 0., 0.], [0., 0., 1.])).yaw
+        );
+        // Any right-stick deflection, even vertical zoom, stops the swing.
+        assert!(wrap(yaw_after(&deflected) - start).abs() < 1e-5);
+        let mut zooming = moving;
+        zooming.zoom = 0.5;
+        assert!(wrap(yaw_after(&zooming) - start).abs() < 1e-5);
+        // Recenter and turn together: the recenter wins, so the yaw target is
+        // behind the player and the manual turn is not applied.
+        let mut both = input([0., 0., 0.], [1., 0., 0.]);
+        both.recenter = true;
+        both.turn = 1.;
+        let mut camera = FollowCamera::new(OUTDOOR, &input([0., 0., 0.], [0., 0., 1.]));
+        camera.tick(&both, &|_, _| None);
+        assert!((camera.yaw_target - behind([1., 0., 0.])).abs() < 1e-5);
     }
 
     #[test]

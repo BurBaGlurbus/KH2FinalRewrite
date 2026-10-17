@@ -6424,6 +6424,7 @@ fn simulate(
     // recenters (test-room bindings for the original's camera buttons).
     let mut turn = 0f32;
     let mut zoom = 0f32;
+    let mut right_stick = 0f32;
     if game.autoplay.is_some() {
         // Unattended runs orbit 180 degrees to check Sora from the front.
         if (660..720).contains(&tick) {
@@ -6436,6 +6437,7 @@ fn simulate(
         // here [test-room mapping of the original height adjust].
         let held = game.pad.held;
         let [_, _, magnitude] = controller::analog(game.pad_data.right);
+        right_stick = magnitude;
         let axis = |pos: u64, neg: u64| {
             ((held & pos != 0) as i32 - (held & neg != 0) as i32) as f32 * magnitude
         };
@@ -6455,7 +6457,11 @@ fn simulate(
     camera.magnitude = stick.length().min(1.);
     camera.turn = turn.clamp(-1., 1.);
     camera.zoom = zoom.clamp(-1., 1.);
+    camera.right_stick = right_stick;
     camera.recenter = std::mem::take(&mut rig.recenter_queued);
+    // Pad bit 32 (R2) keeps manual zoom allowed through the follow target's
+    // zoom lock; no supported actor sets the lock.
+    camera.zoom_override = game.pad.held & (1 << 32) != 0;
     camera.lock_target = if game.target_locked {
         targeting
             .holder
@@ -6472,11 +6478,16 @@ fn simulate(
         ..
     } = &mut *rig;
     let hits = std::cell::Cell::new(0);
-    follow.tick(&camera, &|a, b| {
-        let hit = collision.cast(a, b);
-        hits.set(hits.get() + hit.is_some() as u64);
-        hit
-    });
+    let spheres = enemy_target::camera_spheres(&gallery, to_world);
+    follow.tick_with(
+        &camera,
+        &|a, b| {
+            let hit = collision.cast(a, b);
+            hits.set(hits.get() + hit.is_some() as u64);
+            hit
+        },
+        &spheres,
+    );
     *collision_hits += hits.get();
     rig.previous_position = game.player.position;
     game.tick += 1;
@@ -7517,17 +7528,20 @@ fn hud_tick(
     );
     // The reticle (priority 4000) follows the held target's TARGET shape,
     // projected through the camera as last applied.
-    let held = rig.as_ref().and_then(|rig| {
-        enemy_target::reticle_view(&game, &gallery, &targeting)
-            .map(|(held, at)| (held, rig.camera.project(at)))
-    });
+    let camera = rig.as_ref().map(|rig| rig.camera);
+    let held = camera.and_then(|_| enemy_target::reticle_view(&game, &gallery, &targeting));
     let Hud {
         reticle,
         field,
         reticle_draw,
         ..
     } = &mut *hud;
-    *reticle_draw = reticle.step(&field.sequence, held, 0);
+    *reticle_draw = reticle.step(
+        &field.sequence,
+        held,
+        &|at| camera.map_or([0.; 3], |camera| camera.project(at)),
+        0,
+    );
     // Form levels gained this frame queue their panels (FUN_1403edb90).
     if let Some(d) = game.drive.as_mut() {
         for up in std::mem::take(&mut d.level_ups) {
